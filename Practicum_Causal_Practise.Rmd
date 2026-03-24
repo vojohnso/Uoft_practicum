@@ -1,0 +1,2453 @@
+---
+title: "Practicum_Causal_Practise"
+output: pdf_document
+date: "2026-02-24"
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(WeightIt)
+library(MatchIt)
+library(survminer)
+library(cobalt)
+```
+
+
+# Prep Data
+```{r}
+pred.vars <- c("Age_Dx.dich", "pT_7th", "pN_7th", "ENE_", "PORT", "Max_tumor_size","Total_LN_positive_")
+cat.vars <- c("Age_Dx.dich", "pT_7th", "pN_7th", "ENE_", "PORT")
+cont.vars <- c("Max_tumor_size","Total_LN_positive_")
+
+# Function to prepare data
+prep_data <- function(data) {
+  cat("Starting data preparation...\n")
+  
+  # Check input data immediately
+  if(nrow(data) == 0) {
+    stop("PREP_DATA ERROR: Input data is empty")
+  }
+  
+  # Remove rows with missing Treatment/outcome data - FAIL if critical variables missing
+  if(!all(c("DFStime", "DFS") %in% colnames(data))) {
+    stop("PREP_DATA ERROR: Missing required survival variables DFStime or DFS")
+  }
+  
+  data <- data[!is.na(data$DFStime) & !is.na(data$DFS), ]
+  
+  if(nrow(data) == 0) {
+    stop("PREP_DATA ERROR: No valid survival data remaining after removing NAs")
+  }
+  
+  # CRITICAL FIX: Create Treatment variable from engraftment1
+  if(!"engraftment1" %in% colnames(data)) {
+    stop("PREP_DATA ERROR: engraftment1 variable not found in data - this is the source treatment variable")
+  }
+  
+  # Check what values exist in engraftment1
+  unique_engraft <- unique(data$engraftment1[!is.na(data$engraftment1)])
+  cat("Found engraftment1 values:", paste(unique_engraft, collapse = ", "), "\n")
+  
+  # Create Treatment variable (1 = Engrafter, 0 = Non-Engrafter)
+  # Based on project knowledge: "Engrafter" = 1, "Non-Engrafter" = 0
+  data$Treatment <- ifelse(data$engraftment1 == "Engrafter", 1, 0)
+  
+  # Validate Treatment creation
+  if(all(is.na(data$Treatment))) {
+    stop("PREP_DATA ERROR: Treatment variable creation failed - all values are NA")
+  }
+  
+  treatment_counts <- table(data$Treatment, useNA = "always")
+  cat("Treatment assignment counts:\n")
+  print(treatment_counts)
+  
+  if(sum(!is.na(data$Treatment)) < 20) {
+    stop("PREP_DATA ERROR: Insufficient valid Treatment assignments")
+  }
+  
+  # Create binary versions - FAIL immediately if source variables don't exist
+  if(!"Age_Dx" %in% colnames(data)) {
+    stop("PREP_DATA ERROR: Age_Dx variable not found in data")
+  }
+  
+  # Convert Age_Dx to numeric - fail if conversion impossible
+  data$Age_Dx <- as.numeric(as.character(data$Age_Dx))
+  if(all(is.na(data$Age_Dx))) {
+    stop("PREP_DATA ERROR: Age_Dx could not be converted to numeric")
+  }
+  
+  data$Age_Dx_bin <- ifelse(data$Age_Dx >= median(data$Age_Dx, na.rm = TRUE), 1, 0)
+  
+  # Process other variables - FAIL if expected variables missing
+  var_mappings <- list(
+    pT_7th_bin = "pT_7th",
+    pN_7th_bin = "pN_7th", 
+    ENE_bin = "ENE_",
+    PORT_bin = "PORT"
+  )
+  
+  for(new_var in names(var_mappings)) {
+    old_var <- var_mappings[[new_var]]
+    
+    if(!old_var %in% colnames(data)) {
+      stop(paste("PREP_DATA ERROR: Required variable", old_var, "not found in data"))
+    }
+    
+    if(is.character(data[[old_var]]) || is.factor(data[[old_var]])) {
+      # Convert categorical to binary
+      unique_vals <- unique(data[[old_var]][!is.na(data[[old_var]])])
+      if(length(unique_vals) < 2) {
+        stop(paste("PREP_DATA ERROR: Variable", old_var, "has insufficient unique values:", paste(unique_vals, collapse = ", ")))
+      }
+      
+      # For specific OSCC variables, use proper coding:
+      if(old_var == "pT_7th") {
+        # T3-4 = 1, T1-2 = 0 (based on project knowledge)
+        data[[new_var]] <- ifelse(data[[old_var]] %in% c("T3-4"), 1, 0)
+      } else if(old_var == "pN_7th") {
+        # N2-3 = 1, N0-1 = 0 (based on project knowledge)
+        data[[new_var]] <- ifelse(data[[old_var]] %in% c("N2-3"), 1, 0)
+      } else if(old_var == "ENE_") {
+        # Yes = 1, No = 0
+        data[[new_var]] <- ifelse(data[[old_var]] == "Yes", 1, 0)
+      } else if(old_var == "PORT") {
+        # Yes = 1, No = 0
+        data[[new_var]] <- ifelse(data[[old_var]] == "Yes", 1, 0)
+      } else {
+        # Default: first unique value = 0, others = 1
+        data[[new_var]] <- ifelse(data[[old_var]] == unique_vals[1], 0, 1)
+      }
+    } else {
+      # Convert numeric to binary
+      numeric_vals <- as.numeric(as.character(data[[old_var]]))
+      if(all(is.na(numeric_vals))) {
+        stop(paste("PREP_DATA ERROR: Variable", old_var, "could not be converted to numeric"))
+      }
+      data[[new_var]] <- ifelse(numeric_vals > 0, 1, 0)
+    }
+    cat("Created", new_var, "from", old_var, "\n")
+  }
+  
+  # Ensure continuous variables exist and are numeric - FAIL if missing
+  for(var in c("Max_tumor_size", "Total_LN_positive_")) {
+    if(!var %in% colnames(data)) {
+      stop(paste("PREP_DATA ERROR: Required continuous variable", var, "not found"))
+    }
+    
+    data[[var]] <- as.numeric(as.character(data[[var]]))
+    if(all(is.na(data[[var]]))) {
+      stop(paste("PREP_DATA ERROR: Variable", var, "could not be converted to numeric"))
+    }
+    
+    # Replace negative values with 0 (this is acceptable data cleaning)
+    data[[var]][data[[var]] < 0 | is.na(data[[var]])] <- 0
+  }
+  
+  # Ensure survival variables are properly formatted - FAIL if invalid
+  required_vars <- c("DFStime", "DFS", "OStime", "OS")
+  missing_vars <- required_vars[!required_vars %in% colnames(data)]
+  if(length(missing_vars) > 0) {
+    stop(paste("PREP_DATA ERROR: Missing required survival variables:", paste(missing_vars, collapse = ", ")))
+  }
+  
+  # Convert survival variables to numeric
+  for(var in required_vars) {
+    data[[var]] <- as.numeric(as.character(data[[var]]))
+    if(all(is.na(data[[var]]))) {
+      stop(paste("PREP_DATA ERROR: Survival variable", var, "could not be converted to numeric"))
+    }
+  }
+  
+  # Remove invalid survival data
+  before_count <- nrow(data)
+  data <- data[data$DFStime > 0 & data$OStime > 0 & 
+               !is.na(data$DFStime) & !is.na(data$OStime), ]
+  after_count <- nrow(data)
+  
+  if(after_count == 0) {
+    stop("PREP_DATA ERROR: No valid survival times remaining (all <= 0 or NA)")
+  }
+  
+  if(after_count < before_count * 0.5) {
+    stop(paste("PREP_DATA ERROR: Lost too much data in survival cleaning:", before_count, "->", after_count, "rows"))
+  }
+  
+  # Final validation of Treatment variable
+  final_treatment_table <- table(data$Treatment, useNA = "always")
+  cat("Final Treatment distribution:\n")
+  print(final_treatment_table)
+  
+  if(sum(data$Treatment == 1, na.rm = TRUE) < 5) {
+    stop("PREP_DATA ERROR: Insufficient treated subjects (engrafters)")
+  }
+  
+  if(sum(data$Treatment == 0, na.rm = TRUE) < 5) {
+    stop("PREP_DATA ERROR: Insufficient control subjects (non-engrafters)")
+  }
+  
+  cat("Data preparation completed successfully:", after_count, "valid rows\n")
+  cat("Treatment prevalence:", round(mean(data$Treatment, na.rm = TRUE), 3), "\n")
+  return(data)
+}
+
+original_data <- read.csv("predata_s2.csv")
+
+data <- prep_data(original_data)
+
+pred.vars.processed <- c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin", "ENE_bin", "PORT_bin", "Max_tumor_size", "Total_LN_positive_")
+cat.vars.processed <- c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin", "ENE_bin", "PORT_bin")
+cont.vars.processed <- c("Max_tumor_size", "Total_LN_positive_")
+
+# Create reference data for simulation - FAIL if insufficient data
+ref.data.processed <- data[, pred.vars.processed, drop = FALSE]
+ref.data.processed <- ref.data.processed[complete.cases(ref.data.processed), , drop = FALSE]
+```
+
+# Test out different ways of sampling
+
+# April's Method
+This method consist of:
+(1) Find the structure of the data through its mean and covariance structure
+(2) Use these values to reconstruct/sample the data structures
+(3) For continuous data - this involves fitting a MVN and sampling values there
+(4) For binary data - this involves using the mean as the parameter of a binomial disitribution
+
+The way April simulaltes binary variables - we will use a different method called `ff.dummy.cdf` that uses the CDF of a uniform. 
+
+```{r empirical_distribution_functions}
+# Empirical distribution functions - NO FALLBACKS, direct errors
+# Compute mu and sigma for variables
+ff.mean.sigma <- function(x) {
+  if(!is.data.frame(x)) {
+    x <- as.data.frame(x)
+  }
+  
+  if(nrow(x) == 0 || ncol(x) == 0) {
+    stop("FF.MEAN.SIGMA ERROR: Input data frame has no rows or columns")
+  }
+  
+  if(is.null(colnames(x)) || any(colnames(x) == "")) {
+    stop("FF.MEAN.SIGMA ERROR: Missing or empty column names detected")
+  }
+  
+  cat("Computing empirical distributions for variables:", paste(colnames(x), collapse = ", "), "\n")
+  
+  # Ensure all data is numeric - FAIL if conversion impossible
+  for(i in 1:ncol(x)) {
+    original_values <- x[, i]
+    x[, i] <- as.numeric(as.character(x[, i]))
+    
+    if(all(is.na(x[, i]))) {
+      stop(paste("FF.MEAN.SIGMA ERROR: Column", colnames(x)[i], "could not be converted to numeric"))
+    }
+    
+    # Check for non-finite values
+    non_finite_count <- sum(!is.finite(x[, i]))
+    if(non_finite_count > nrow(x) * 0.5) {
+      stop(paste("FF.MEAN.SIGMA ERROR: Column", colnames(x)[i], "has too many non-finite values:", non_finite_count, "/", nrow(x)))
+    }
+    
+    # Replace non-finite with 0 (acceptable for binary variables)
+    x[!is.finite(x[, i]), i] <- 0
+  }
+  
+  # Calculate variance and means
+  mu <- colMeans(x, na.rm = TRUE)
+  sigma <- var(x, use = "pairwise.complete.obs")
+  
+  if(any(is.na(sigma)) || any(is.na(mu))) {
+    stop("FF.MEAN.SIGMA ERROR: NA values detected in computed variance or means")
+  }
+  
+  # Check for positive definite covariance matrix - FAIL if not fixable
+  # Positive eigvenvalues => positive definite covariance
+  eigenvals <- eigen(sigma, only.values = TRUE)$values
+  min_eigenval <- min(eigenvals)
+  
+  if(min_eigenval <= 1e-8) {
+    cat("Warning: Non-positive definite covariance matrix detected. Min eigenvalue:", min_eigenval, "\n")
+    # Add minimal regularization
+    regularization <- max(1e-6, abs(min_eigenval) + 1e-6)
+    sigma <- sigma + diag(regularization, nrow(sigma))
+    cat("Added regularization:", regularization, "\n")
+    
+    # Check if regularization worked
+    new_eigenvals <- eigen(sigma, only.values = TRUE)$values
+    if(min(new_eigenvals) <= 0) {
+      stop("FF.MEAN.SIGMA ERROR: Could not create positive definite covariance matrix even after regularization")
+    }
+  }
+  
+  return(list(mu = mu, sigma = sigma))
+}
+
+# Binary variable conversion - NO FALLBACKS
+# Convert a simulated column into a binary column
+ff.dummy <- function(sim_data, empirical_dist, var_name) {
+  if(!var_name %in% colnames(sim_data)) {
+    stop(paste("FF.DUMMY ERROR: Variable", var_name, "not found in simulation data"))
+  }
+  
+  if(!var_name %in% names(empirical_dist$mu)) {
+    stop(paste("FF.DUMMY ERROR: Variable", var_name, "not found in empirical distribution"))
+  }
+  
+  empirical_prop <- empirical_dist$mu[var_name]
+  
+  if(is.na(empirical_prop) || !is.finite(empirical_prop)) {
+    stop(paste("FF.DUMMY ERROR: Invalid empirical proportion for", var_name, ":", empirical_prop))
+  }
+  
+  if(empirical_prop < 0 || empirical_prop > 1) {
+    stop(paste("FF.DUMMY ERROR: Empirical proportion out of bounds [0,1] for", var_name, ":", empirical_prop))
+  }
+  
+  simulated_vals <- as.numeric(sim_data[, var_name])
+  
+  if(all(is.na(simulated_vals))) {
+    stop(paste("FF.DUMMY ERROR: All simulated values for", var_name, "are NA"))
+  }
+  
+  # Calculate threshold based on empirical proportion
+  threshold <- quantile(simulated_vals, 1 - empirical_prop, na.rm = TRUE)
+  
+  sim_data[, var_name] <- ifelse(simulated_vals > threshold, 1, 0)
+  
+  simulated_prop <- mean(sim_data[, var_name], na.rm = TRUE)
+  cat("Converted", var_name, "to binary: empirical prop =", round(empirical_prop, 3), 
+      ", simulated prop =", round(simulated_prop, 3), "\n")
+  
+  return(sim_data)
+}
+
+# Instead convert the normals into uniform through the normal CDF:
+ff.dummy_cdf <- function(sim_data, empirical_dist, var_name) {
+  if(!var_name %in% colnames(sim_data)) {
+    stop(paste("FF.DUMMY_CDF ERROR: Variable", var_name, "not found in simulation data"))
+  }
+  
+  if(!var_name %in% names(empirical_dist$mu)) {
+    stop(paste("FF.DUMMY_CDF ERROR: Variable", var_name, "not found in empirical distribution"))
+  }
+  
+  if(!(var_name %in% rownames(empirical_dist$sigma))) {
+    stop(paste("FF.DUMMY_CDF ERROR: Variable", var_name, "not found in covariance matrix"))
+  }
+  
+  empirical_prop <- empirical_dist$mu[var_name]
+  
+  if(is.na(empirical_prop) || !is.finite(empirical_prop) || empirical_prop < 0 || empirical_prop > 1) {
+    stop(paste("FF.DUMMY_CDF ERROR: Invalid empirical proportion for", var_name, ":", empirical_prop))
+  }
+  
+  z <- as.numeric(sim_data[[var_name]])
+  
+  if(all(is.na(z))) {
+    stop(paste("FF.DUMMY_CDF ERROR: All simulated values for", var_name, "are NA"))
+  }
+  
+  mu_z <- empirical_dist$mu[var_name]
+  sd_z <- sqrt(empirical_dist$sigma[var_name, var_name])
+  
+  if(!is.finite(sd_z) || sd_z <= 0) {
+    stop(paste("FF.DUMMY_CDF ERROR: Invalid latent SD for", var_name, ":", sd_z))
+  }
+  
+  # Convert latent normal values to U(0,1) using the normal CDF
+  u <- pnorm(z, mean = mu_z, sd = sd_z)
+  
+  # Assign binary values using the empirical prevalence
+  sim_data[[var_name]] <- ifelse(u <= empirical_prop, 1, 0)
+  
+  simulated_prop <- mean(sim_data[[var_name]], na.rm = TRUE)
+  cat("Converted", var_name,
+      "to binary via CDF: empirical prop =", round(empirical_prop, 3),
+      ", simulated prop =", round(simulated_prop, 3), "\n")
+  
+  return(sim_data)
+}
+
+# Simulate covariates based on the empirical distribution 
+# Covariate simulation - NO FALLBACKS
+simulate_covariates_empirical <- function(empirical_dist, n_sim, variables, cat_vars, cont_vars) {
+  cat("\n=== SIMULATING COVARIATES USING EMPIRICAL DISTRIBUTIONS ===\n")
+  cat("Sample size:", n_sim, "\n")
+  cat("Variables:", paste(variables, collapse = ", "), "\n")
+  
+  if(n_sim <= 0) {
+    stop("SIMULATE_COVARIATES ERROR: Invalid sample size:", n_sim)
+  }
+  
+  if(length(variables) == 0) {
+    stop("SIMULATE_COVARIATES ERROR: No variables specified for simulation")
+  }
+  
+  # Check empirical distribution validity
+  missing_vars <- variables[!variables %in% names(empirical_dist$mu)]
+  if(length(missing_vars) > 0) {
+    stop(paste("SIMULATE_COVARIATES ERROR: Variables missing from empirical distribution:", paste(missing_vars, collapse = ", ")))
+  }
+  
+  if(any(!is.finite(empirical_dist$mu[variables]))) {
+    stop("SIMULATE_COVARIATES ERROR: Non-finite means detected in empirical distribution")
+  }
+  
+  cat("Using empirical means:", paste(round(empirical_dist$mu[variables], 3), collapse = ", "), "\n")
+  
+  # Extract covariance matrix for specified variables
+  cov_matrix <- empirical_dist$sigma[variables, variables]
+  
+  # Ensure matrix is symmetric
+  if(!isSymmetric(cov_matrix)) {
+    cov_matrix <- (cov_matrix + t(cov_matrix)) / 2
+  }
+  
+  # Generate multivariate normal data - FAIL if impossible
+  sim_data <- as.data.frame(MASS::mvrnorm(n = n_sim, 
+                                         mu = empirical_dist$mu[variables], 
+                                         Sigma = cov_matrix))
+  colnames(sim_data) <- variables
+  cat("Generated", nrow(sim_data), "subjects with", ncol(sim_data), "variables\n")
+  
+  # Transform binary variables
+  for(var in cat_vars) {
+    if(var %in% variables) {
+      sim_data <- ff.dummy_cdf(sim_data, empirical_dist, var)
+    }
+  }
+  cat("Sucessfully transformed category variables: ", paste(cat_vars, collapse = ", "), "\n")
+  
+  # Ensure continuous variables are non-negative
+  for(var in cont_vars) {
+    if(var %in% variables) {
+      negative_count <- sum(sim_data[, var] < 0)
+      if(negative_count > 0) {
+        cat("Applied non-negativity constraint to", var, "(", negative_count, "negative values)\n")
+      }
+      sim_data[, var] <- pmax(0, as.numeric(sim_data[, var]))
+    }
+  }
+  
+  cat("=== COVARIATE SIMULATION COMPLETED ===\n\n")
+  return(sim_data)
+}
+```
+
+# Let's try it out
+```{r}
+# Create empirical distribution and models - FAIL immediately on any error
+cat("Creating empirical distribution...\n")
+empirical_dist <- ff.mean.sigma(ref.data.processed)
+empirical_dist
+
+fixed_objects <- list(
+  empirical_dist = empirical_dist,
+#  baseline_models = baseline_models,
+#  treatment_models = treatment_models,
+  pred.vars.processed = pred.vars.processed,
+  cat.vars.processed = cat.vars.processed,
+  cont.vars.processed = cont.vars.processed,
+  original_data = data
+)
+# Using this we can simulate 10 observations
+simulated_covariates1 <-
+  simulate_covariates_empirical(empirical_dist, 10, pred.vars.processed, cat.vars.processed,
+                              cont.vars.processed)
+```
+
+# Next up we have the survival models that are used.
+# We can first create baseline models that are run the current data
+These survival models will be used to simulate outcomes + treatment. 
+Essentially to simualte survival outcomes we need a model
+$$T \sim \text{distribution depending on }X$$
+
+# How do we simulate treatment variables?
+Treatment in this case depends on the underlying covariates and thus we cannot just naively simulate similarly to the covariates. We can run a logistic regression to assess which covariates might have a linear correlation with the Engrafter treatment. This is also called propensity scores. 
+
+```{r}
+# Distribution of treatment
+# --- 1. Fit logistic regression of treatment on covariates ---
+fit_trt <- glm(Treatment ~ Age_Dx_bin + pT_7th_bin + pN_7th_bin +
+                           ENE_bin + PORT_bin + Max_tumor_size + Total_LN_positive_,
+               data = data, family = binomial)
+
+summary(fit_trt)
+
+# --- 2. Extract propensity scores ---
+data$ps <- predict(fit_trt, type = "response")
+
+# --- 3. Visualize propensity score distribution by treatment ---
+ggplot(data, aes(x = ps, fill = factor(Treatment))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("#E74C3C", "#2ECC71"),
+                    labels = c("Non-Engrafter", "Engrafter")) +
+  labs(title = "Propensity Score Distribution by Treatment",
+       x = "P(Engrafter | Covariates)", y = "Density", fill = "Treatment") +
+  theme_minimal()
+
+# --- 4. Covariate means by treatment (Table 1 style) ---
+data %>%
+  group_by(Treatment) %>%
+  summarise(across(all_of(pred.vars.processed), mean, .names = "{.col}"), n = n()) %>%
+  mutate(Treatment = ifelse(Treatment == 1, "Engrafter", "Non-Engrafter"))
+```
+Based on the above model, we see that pN_7th_bin, ENE_bin and Total_LN_positive all are significant covariates in estimating treatment. Other variables like age and pT_7th_bin are not significant. We can also plot the propensity scores based on treatment to see how they are distributed. From this we clearly see they differ significantly. Finally, we can plot the covariate means based on treatment. We see that once again, pN_7th_bin and ENE_bin differ significantly. 
+
+Overall we confirm we should simulate engrafters/treatment by this glm model. 
+
+# April's paper also uses PORT as a treatment. Let's check why:
+
+```{r}
+# Distribution of PORT
+# --- 1. Fit logistic regression of treatment on covariates ---
+fit_port <- glm(PORT_bin ~ Age_Dx_bin + pT_7th_bin + pN_7th_bin +
+                           ENE_bin + Max_tumor_size + Total_LN_positive_,
+               data = data, family = binomial)
+
+summary(fit_port)
+
+# --- 2. Extract propensity scores ---
+data$post_ps <- predict(fit_port, type = "response")
+
+# --- 3. Visualize propensity score distribution by treatment ---
+ggplot(data, aes(x = post_ps, fill = factor(PORT_bin))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("#E74C3C", "#2ECC71"),
+                    labels = c("No", "Yes")) +
+  labs(title = "Propensity Score Distribution by PORT",
+       x = "P(PORT | Covariates)", y = "Density", fill = "PORT_bin") +
+  theme_minimal()
+
+# --- 4. Covariate means by treatment (Table 1 style) ---
+pred.vars.noport <- c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin", "ENE_bin", "Max_tumor_size", "Total_LN_positive_")
+data %>%
+  group_by(PORT_bin) %>%
+  summarise(across(all_of(pred.vars.noport), mean, .names = "{.col}"), n = n()) 
+```
+We see that pN_7th significantly differs with pT_7th and that the propensity score distributions look pretty different. We might consider this as a treatment then. 
+
+We can see when this does not hold - in age. 
+
+```{r}
+# Distribution of Age
+# --- 1. Fit logistic regression of treatment on covariates ---
+fit_age <- glm(Age_Dx_bin ~ PORT_bin + pT_7th_bin + pN_7th_bin +
+                           ENE_bin + Max_tumor_size + Total_LN_positive_,
+               data = data, family = binomial)
+
+summary(fit_age)
+
+# --- 2. Extract propensity scores ---
+data$post_age <- predict(fit_age, type = "response")
+
+# --- 3. Visualize propensity score distribution by treatment ---
+ggplot(data, aes(x = post_age, fill = factor(Age_Dx_bin))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("#E74C3C", "#2ECC71"),
+                    labels = c("No", "Yes")) +
+  labs(title = "Propensity Score Distribution by Age",
+       x = "P(Age | Covariates)", y = "Density", fill = "Age_Dx_bin") +
+  theme_minimal()
+
+# --- 4. Covariate means by treatment (Table 1 style) ---
+pred.vars.noage <- c("PORT_bin", "pT_7th_bin", "pN_7th_bin", "ENE_bin", "Max_tumor_size", "Total_LN_positive_")
+data %>%
+  group_by(Age_Dx_bin) %>%
+  summarise(across(all_of(pred.vars.noage), mean, .names = "{.col}"), n = n()) 
+```
+Looking at age we see the distribution of the propensity scores are very similar and that the distribution of covariates are close to balanced between the two age groups. Hence in this case there is no reason to simulate age using a model of the covariates. 
+
+In conclusion, PORT_bin and treatment will be simulated by models.
+```{r}
+# Treatment model estimation - NO FALLBACKS
+# Fits two logistic regressions for treatment and PORT
+estimate_treatment_models <- function(data){
+  cat("Extracting empirical treatment assignment patterns from OSCC data...\n")
+  
+  if(nrow(data) == 0) {
+    stop("TREATMENT_MODELS ERROR: Input data is empty")
+  }
+  
+  # Check if required variables exist
+  required_vars <- c("Age_bin_DX", "ENE_bin", "pN_7th_bin", "pT_7th_bin", "Max_tumor_size", "Total_LN_positive_")
+  available_vars <- intersect(required_vars, colnames(data))
+  
+  if(length(available_vars) == 0) {
+    stop("TREATMENT_MODELS ERROR: No predictor variables available for treatment models")
+  }
+  
+  cat("Using variables for treatment model:", paste(available_vars, collapse = ", "), "\n")
+  
+  # Model 1: Treatment patterns (using "Treatment" variable if available)
+  engraftment_model <- NULL
+  if("Treatment" %in% colnames(data)) {
+    formula_str <- paste("Treatment ~", paste(available_vars, collapse = " + "))
+    treatment_formula <- as.formula(formula_str)
+    
+    cat("Fitting engraftment model...\n")
+    engraftment_model <- glm(treatment_formula, data = data, family = binomial())
+    
+    if(is.null(engraftment_model) || any(is.na(coef(engraftment_model)))) {
+      stop("TREATMENT_MODELS ERROR: Engraftment model failed or produced NA coefficients")
+    }
+    
+    cat("Empirical treatment model:\n")
+    print(round(coef(engraftment_model), 3))
+    cat("Observed treatment rate:", round(mean(data$Treatment, na.rm = TRUE), 3), "\n\n")
+  } else {
+    stop("TREATMENT_MODELS ERROR: Treatment variable not found in data")
+  }
+  
+  # Model 2: PORT assignment patterns
+  PORT_model <- NULL
+  if("PORT_bin" %in% colnames(data)) {
+    formula_str <- paste("PORT_bin ~", paste(available_vars, collapse = " + "))
+    PORT_formula <- as.formula(formula_str)
+    
+    cat("Fitting PORT model...\n")
+    PORT_model <- glm(PORT_formula, data = data, family = binomial())
+    
+    if(is.null(PORT_model) || any(is.na(coef(PORT_model)))) {
+      stop("TREATMENT_MODELS ERROR: PORT model failed or produced NA coefficients")
+    }
+    
+    cat("Empirical PORT model:\n")
+    print(round(coef(PORT_model), 3))
+    cat("Observed PORT rate:", round(mean(data$PORT_bin, na.rm = TRUE), 3), "\n\n")
+  } else {
+    stop("TREATMENT_MODELS ERROR: PORT_bin variable not found in data")
+  }
+  
+  return(list(
+    engraftment_model = coef(engraftment_model),
+    PORT_model = coef(PORT_model)
+  ))
+}
+```
+
+```{r}
+simulate_treatment_assignment <- function(sim_data, treatment_type, treatment_models) {
+  
+  if(nrow(sim_data) == 0) {
+    stop("TREATMENT_ASSIGNMENT ERROR: Simulation data is empty")
+  }
+  
+  if(treatment_type == "engraftment") {
+    model_coefs <- treatment_models$engraftment_model  
+  } else if(treatment_type == "PORT") {
+    model_coefs <- treatment_models$PORT_model  
+  } else {
+    stop(paste("TREATMENT_ASSIGNMENT ERROR: Unknown treatment type:", treatment_type))
+  }
+  
+  if(is.null(model_coefs) || length(model_coefs) == 0) {
+    stop(paste("TREATMENT_ASSIGNMENT ERROR: No coefficients available for treatment type:", treatment_type))
+  }
+  
+  cat("Using EMPIRICAL treatment coefficients from OSCC data\n")
+  cat("Coefficients: Intercept =", round(model_coefs[1], 3))
+  if(length(model_coefs) > 1) {
+    cat(", Others =", paste(round(model_coefs[2:min(3, length(model_coefs))], 3), collapse = ", "))
+  }
+  cat("\n")
+  
+  # Find available variables for treatment model
+  available_vars <- intersect(c("ENE_bin", "pN_7th_bin", "pT_7th_bin", "Max_tumor_size", "Total_LN_positive_"), 
+                              colnames(sim_data))
+  
+  if(length(available_vars) == 0) {
+    stop("TREATMENT_ASSIGNMENT ERROR: No predictor variables available in simulation data")
+  }
+  
+  # Create formula dynamically
+  formula_str <- paste("~", paste(available_vars, collapse = " + "))
+  
+  # Scale continuous variables if they exist
+  sim_data_scaled <- sim_data
+  for(var in available_vars) {
+    if(var %in% c("Max_tumor_size", "Total_LN_positive_")) {
+      scaled_vals <- scale(sim_data[[var]])[,1]
+      if(any(!is.finite(scaled_vals))) {
+        stop(paste("TREATMENT_ASSIGNMENT ERROR: Scaling produced non-finite values for", var))
+      }
+      sim_data_scaled[[var]] <- scaled_vals
+    }
+  }
+  
+  # Create design matrix
+  X_treatment <- model.matrix(as.formula(formula_str), data = sim_data_scaled)
+  
+  if(ncol(X_treatment) != length(model_coefs)) {
+    stop(paste("TREATMENT_ASSIGNMENT ERROR: Design matrix columns (", ncol(X_treatment), 
+               ") don't match coefficient length (", length(model_coefs), ")"))
+  }
+  
+  # Calculate linear predictor
+  linear_pred <- X_treatment %*% model_coefs
+  
+  if(any(!is.finite(linear_pred))) {
+    stop("TREATMENT_ASSIGNMENT ERROR: Linear predictor contains non-finite values")
+  }
+  
+  treatment_prob <- plogis(linear_pred)
+  treatment <- rbinom(nrow(sim_data), 1, treatment_prob)
+  
+  cat("Treatment assignment summary:\n")
+  cat("  Treatment prevalence:", round(mean(treatment), 3), "\n")
+  cat("  Propensity score range:", round(min(treatment_prob), 3), "-", round(max(treatment_prob), 3), "\n")
+  
+  return(treatment)
+}
+```
+
+
+# How do we simulate the outcome variables? 
+There are two options: we can either simulate similarly to the covariates by their embedded structures or model their DGP. The best way is the latter. We know that the outcomes will be related to our covariates and treatment. We can create a survival model on the real data and use this to simulate outcomes.
+
+On survival data, this just means fitting a Cox PH or Weibull model on covariates onto an outcome. Using a baseline model i,e model fitted on the current dataset, we can get a model that is used to generate/predict outcome values on simulated data. Here we can use this function and then try it on our own. 
+```{r}
+# Baseline model estimation - NO FALLBACKS, direct errors
+# Fit baseline models for DFS and OS (Cox models and Weibull models)
+estimate_baseline_models <- function(data) {
+  
+  if(nrow(data) == 0) {
+    stop("BASELINE_MODELS ERROR: Input data is empty")
+  }
+  
+  # Check for required survival variables
+  required_vars <- c("DFStime", "DFS", "OStime", "OS")
+  missing_vars <- required_vars[!required_vars %in% colnames(data)]
+  if(length(missing_vars) > 0) {
+    stop(paste("BASELINE_MODELS ERROR: Missing required survival variables:", paste(missing_vars, collapse = ", ")))
+  }
+  
+  # Find available predictor variables
+  available_vars <- intersect(c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin", 
+                                "ENE_bin", "PORT_bin", "Max_tumor_size", "Total_LN_positive_"), 
+                              colnames(data))
+  
+  if(length(available_vars) == 0) {
+    stop("BASELINE_MODELS ERROR: No predictor variables available for baseline models")
+  }
+  
+  cat("Using predictor variables:", paste(available_vars, collapse = ", "), "\n")
+  
+  # Create model formulas
+  formula_str <- paste("Surv(DFStime, DFS) ~", paste(available_vars, collapse = " + "))
+  dfs_formula <- as.formula(formula_str)
+  
+  formula_str_os <- paste("Surv(OStime, OS) ~", paste(available_vars, collapse = " + "))
+  os_formula <- as.formula(formula_str_os)
+  
+  # Fit Cox models - FAIL if model fitting fails
+  cat("Fitting DFS Cox model...\n")
+  dfs_model <- coxph(dfs_formula, data = data)
+  
+  if(is.null(dfs_model) || any(is.na(coef(dfs_model)))) {
+    stop("BASELINE_MODELS ERROR: DFS Cox model failed or produced NA coefficients")
+  }
+  
+  cat("Fitting OS Cox model...\n")
+  os_model <- coxph(os_formula, data = data)
+  
+  if(is.null(os_model) || any(is.na(coef(os_model)))) {
+    stop("BASELINE_MODELS ERROR: OS Cox model failed or produced NA coefficients")
+  }
+  
+  # Estimate Weibull parameters for simulation - FAIL if impossible
+  cat("Fitting DFS Weibull model...\n")
+  dfs_survreg <- survreg(Surv(DFStime, DFS) ~ 1, data = data, dist = "weibull")
+  
+  if(is.null(dfs_survreg) || is.na(dfs_survreg$coefficients[1]) || is.na(dfs_survreg$scale)) {
+    stop("BASELINE_MODELS ERROR: DFS Weibull model failed or produced NA parameters")
+  }
+  
+  dfs_lambda <- exp(-dfs_survreg$coefficients[1] / dfs_survreg$scale)
+  dfs_gamma <- 1/dfs_survreg$scale
+  
+  if(!is.finite(dfs_lambda) || !is.finite(dfs_gamma) || dfs_lambda <= 0 || dfs_gamma <= 0) {
+    stop(paste("BASELINE_MODELS ERROR: Invalid DFS Weibull parameters: lambda =", dfs_lambda, ", gamma =", dfs_gamma))
+  }
+  
+  cat("Fitting OS Weibull model...\n")
+  os_survreg <- survreg(Surv(OStime, OS) ~ 1, data = data, dist = "weibull")
+  
+  if(is.null(os_survreg) || is.na(os_survreg$coefficients[1]) || is.na(os_survreg$scale)) {
+    stop("BASELINE_MODELS ERROR: OS Weibull model failed or produced NA parameters")
+  }
+  
+  os_lambda <- exp(-os_survreg$coefficients[1] / os_survreg$scale)
+  os_gamma <- 1/os_survreg$scale
+  
+  if(!is.finite(os_lambda) || !is.finite(os_gamma) || os_lambda <= 0 || os_gamma <= 0) {
+    stop(paste("BASELINE_MODELS ERROR: Invalid OS Weibull parameters: lambda =", os_lambda, ", gamma =", os_gamma))
+  }
+  
+  cat("Baseline models fitted successfully\n")
+  
+  return(list(
+    dfs_cox = dfs_model,
+    os_cox = os_model,
+    dfs_lambda = dfs_lambda,
+    dfs_gamma = dfs_gamma,
+    os_lambda = os_lambda,
+    os_gamma = os_gamma,
+    dfs_coef = coef(dfs_model),
+    os_coef = coef(os_model)
+  ))
+}
+baseline_models <- estimate_baseline_models(data)
+dfs_coef_baseline = baseline_models$dfs_coef
+os_coef_baseline = baseline_models$os_coef
+dfs_coef_baseline
+os_coef_baseline
+```
+Trying it ourselves:
+```{r}
+# OS model
+os_formula = formula(paste("Surv(OStime, OS) ~", paste(pred.vars.processed, collapse = " + ")))
+os_cox <- coxph(os_formula, data=data)
+#summary(os_cox)
+coef(os_cox)
+
+# DFS model
+dfs_formula = formula(paste("Surv(DFStime, DFS) ~", paste(pred.vars.processed, collapse = " + ")))
+dfs_cox <- coxph(dfs_formula, data=data)
+#summary(dfs_cox)
+coef(dfs_cox)
+
+# Weibull models
+os_weibull <- survreg(Surv(OStime, OS) ~ 1, data = data, dist = "weibull")
+dfs_weibull <- survreg(Surv(DFStime, DFS) ~ 1, data = data, dist = "weibull")
+```
+
+We note that to simulate survival times, there is a need to describe the data-generating processes for the Cox proportional hazards model. This can be generated by 
+$$T = \left(\cfrac{-\log(U)}{\lambda e^{X\beta}}\right)^{1/\gamma}$$
+where $U \sim \text{Uniform}(0,1)$. We have $X\beta$ to be the linear predictor derived from the Cox model and $\gamma$ and $\lambda$ are the Weibull shape and scale.  
+
+```{r}
+lambda_os <- exp(os_weibull$coefficients[1])
+gamma_os <- 1/(os_weibull$scale)
+lambda_dfs <- exp(dfs_weibull$coefficients[1])
+gamma_dfs <- 1/(dfs_weibull$scale)
+
+lp_os <- predict(os_cox, newdata = data, type = "lp")
+lp_dfs <- predict(dfs_cox, newdata = data, type = "lp")
+
+unif_samples <- runif(100, 0, 1)
+t_os <- (-log(unif_samples)/(lambda_os * exp(lp_os)))^(1/gamma_os)
+t_dfs <- (-log(unif_samples)/(lambda_dfs * exp(lp_dfs)))^(1/gamma_dfs)
+```
+
+Now when we are trying to simulate outcomes, we want to use the survival models fitted on survival times/events with the covariates. We don't add the treatment in these baseline models since we can inject the treatment effect later when we are doing the simulations. This also allows us to control what the treatment effect might look like. Recall that the true hazard ratio is given by the coefficient
+$$\beta = \log(HR)$$
+so adding `log(hr_treatment) * treatment` into the linear predictor artificially injects a choosen treatment effect. We can fit our current data on the covariates and treatment to find the true hazard ratio. This will be the exponentiated coefficient attached to `Treatment`:
+
+```{r}
+full_os_formula = formula(paste("Surv(OStime, OS) ~ Treatment +", paste(pred.vars.processed, collapse = " + ")))
+full_os_cox <- coxph(full_os_formula, data=data)
+#summary(os_cox)
+coef(full_os_cox)
+hr_os <- exp(coef(full_os_cox)["Treatment"])
+cat("The Hazard Ratio for the OS model is", hr_os, "\n")
+
+# DFS model
+full_dfs_formula = formula(paste("Surv(DFStime, DFS) ~ + Treatment +", paste(pred.vars.processed, collapse = " + ")))
+full_dfs_cox <- coxph(full_dfs_formula, data=data)
+#summary(dfs_cox)
+coef(full_dfs_cox)
+hr_dfs <- exp(coef(full_dfs_cox)["Treatment"])
+cat("The Hazard Ratio for the DFS model is", hr_dfs, "\n")
+
+# With confidence intervals
+exp(confint(full_os_cox)["Treatment", ])
+exp(confint(full_dfs_cox)["Treatment", ])
+```
+Interestingly the HR for the OS and DFS respectively are 2.15 and 1.95. This is really high and insuinates that the treatment `engraftment` results in more events (i.e deaths). Of course, this is affected heavily by other factors and confounding. Note 
+
+We can look at the density of the outcomes. 
+```{r}
+# OS
+p1 <- ggplot(data, aes(x = OStime, fill = factor(OS))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("#2ECC71", "#E74C3C"),
+                    labels = c("Censored (alive)", "Event (died)")) +
+  labs(title = "Overall Survival",
+       x = "Time (years)", y = "Density", fill = "Status") +
+  theme_minimal()
+
+# DFS
+p2 <- ggplot(data, aes(x = DFStime, fill = factor(DFS))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("#2ECC71", "#E74C3C"),
+                    labels = c("Censored (event-free)", "Event (recurrence/death)")) +
+  labs(title = "Disease-Free Survival",
+       x = "Time (years)", y = "Density", fill = "Status") +
+  theme_minimal()
+
+p1
+p2
+```
+We can also look at the distribution of outcomes based on treatment:
+```{r}
+data %>% 
+  group_by(Treatment) %>% 
+  summarise(mean(OS), mean(DFS))
+
+# OS by treatment
+p1 <- ggplot(data, aes(x = OStime, fill = factor(OS))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("#2ECC71", "#E74C3C"),
+                    labels = c("Censored (alive)", "Event (died)")) +
+  labs(title = "Overall Survival by Treatment",
+       x = "Time (years)", y = "Density", fill = "Status") +
+  facet_wrap(~ factor(Treatment, labels = c("Non-Engrafter", "Engrafter"))) +
+  theme_minimal()
+
+# DFS by treatment
+p2 <- ggplot(data, aes(x = DFStime, fill = factor(DFS))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("#2ECC71", "#E74C3C"),
+                    labels = c("Censored (event-free)", "Event (recurrence/death)")) +
+  labs(title = "Disease-Free Survival by Treatment",
+       x = "Time (years)", y = "Density", fill = "Status") +
+  facet_wrap(~ factor(Treatment, labels = c("Non-Engrafter", "Engrafter"))) +
+  theme_minimal()
+
+p1 
+p2
+```
+The table shows that for those in the treatment group that events happen much more often. We clearly see that those with engraftment had more events occurring early - which explains the high HR. Now one major reason why the HR is higher for engrafters is that those who got engrafted would be more sick/ill. This is why one might want to use causal inference. We can rerun this section on the weighted data later.
+
+```{r}
+# Outcome simulation - NO FALLBACKS
+# Simulates two independent survival times (DFS, OS) using Weibull prop hazards form 
+simulate_outcomes <- function(dataset, treatment, hr_treatment_dfs = 1.5, hr_treatment_os = 1.3, baseline_models) {
+  
+  if(nrow(dataset) == 0) {
+    stop("OUTCOME_SIMULATION ERROR: Dataset is empty")
+  }
+  
+  if(length(treatment) != nrow(dataset)) {
+    stop(paste("OUTCOME_SIMULATION ERROR: Treatment length (", length(treatment), 
+               ") doesn't match dataset rows (", nrow(dataset), ")"))
+  }
+  
+  # Safe coefficient extraction function - NO FALLBACKS
+  safe_coef <- function(coef_vector, var_name) {
+    if(is.null(coef_vector) || length(coef_vector) == 0) {
+      return(0)  # Acceptable default for missing coefficients
+    }
+    if(var_name %in% names(coef_vector)) {
+      coef_val <- coef_vector[var_name]
+      if(is.na(coef_val) || !is.finite(coef_val)) {
+        stop(paste("OUTCOME_SIMULATION ERROR: Invalid coefficient for", var_name, ":", coef_val))
+      }
+      return(coef_val)
+    } else {
+      return(0)  # Acceptable default for missing variables
+    }
+  }
+  
+  # Calculate linear predictors
+  linear_pred_dfs <- log(hr_treatment_dfs) * treatment
+  linear_pred_os <- log(hr_treatment_os) * treatment
+  
+  # Add covariate effects if available
+  available_vars <- intersect(c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin", "ENE_bin", "PORT_bin"), 
+                              colnames(dataset))
+  
+  for(var in available_vars) {
+    dfs_coef <- safe_coef(baseline_models$dfs_coef, var)
+    os_coef <- safe_coef(baseline_models$os_coef, var)
+    
+    linear_pred_dfs <- linear_pred_dfs + dfs_coef * dataset[[var]]
+    linear_pred_os <- linear_pred_os + os_coef * dataset[[var]]
+  }
+  
+  # Handle continuous variables with scaling
+  if("Max_tumor_size" %in% colnames(dataset)) {
+    scaled_var <- scale(dataset$Max_tumor_size)[,1]
+    if(any(!is.finite(scaled_var))) {
+      stop("OUTCOME_SIMULATION ERROR: Scaling Max_tumor_size produced non-finite values")
+    }
+    
+    dfs_coef <- safe_coef(baseline_models$dfs_coef, "Max_tumor_size")
+    os_coef <- safe_coef(baseline_models$os_coef, "Max_tumor_size")
+    
+    linear_pred_dfs <- linear_pred_dfs + dfs_coef * scaled_var
+    linear_pred_os <- linear_pred_os + os_coef * scaled_var
+  }
+  
+  if("Total_LN_positive_" %in% colnames(dataset)) {
+    scaled_var <- scale(dataset$Total_LN_positive_)[,1]
+    if(any(!is.finite(scaled_var))) {
+      stop("OUTCOME_SIMULATION ERROR: Scaling Total_LN_positive_ produced non-finite values")
+    }
+    
+    dfs_coef <- safe_coef(baseline_models$dfs_coef, "Total_LN_positive_")
+    os_coef <- safe_coef(baseline_models$os_coef, "Total_LN_positive_")
+    
+    linear_pred_dfs <- linear_pred_dfs + dfs_coef * scaled_var
+    linear_pred_os <- linear_pred_os + os_coef * scaled_var
+  }
+  
+  # Check for non-finite linear predictors
+  if(any(!is.finite(linear_pred_dfs))) {
+    stop("OUTCOME_SIMULATION ERROR: DFS linear predictor contains non-finite values")
+  }
+  
+  if(any(!is.finite(linear_pred_os))) {
+    stop("OUTCOME_SIMULATION ERROR: OS linear predictor contains non-finite values")
+  }
+  
+  # Generate survival times using Weibull distribution
+  u_dfs <- runif(nrow(dataset)) 
+  u_os <- runif(nrow(dataset))
+  
+  # Validate Weibull parameters
+  if(baseline_models$dfs_lambda <= 0 || !is.finite(baseline_models$dfs_lambda)) {
+    stop(paste("OUTCOME_SIMULATION ERROR: Invalid DFS lambda parameter:", baseline_models$dfs_lambda))
+  }
+  
+  if(baseline_models$dfs_gamma <= 0 || !is.finite(baseline_models$dfs_gamma)) {
+    stop(paste("OUTCOME_SIMULATION ERROR: Invalid DFS gamma parameter:", baseline_models$dfs_gamma))
+  }
+  
+  if(baseline_models$os_lambda <= 0 || !is.finite(baseline_models$os_lambda)) {
+    stop(paste("OUTCOME_SIMULATION ERROR: Invalid OS lambda parameter:", baseline_models$os_lambda))
+  }
+  
+  if(baseline_models$os_gamma <= 0 || !is.finite(baseline_models$os_gamma)) {
+    stop(paste("OUTCOME_SIMULATION ERROR: Invalid OS gamma parameter:", baseline_models$os_gamma))
+  }
+  
+  # Calculate survival times
+  dfs_times <- (-log(u_dfs) / (baseline_models$dfs_lambda * exp(linear_pred_dfs)))^(1/baseline_models$dfs_gamma)
+  os_times <- (-log(u_os) / (baseline_models$os_lambda * exp(linear_pred_os)))^(1/baseline_models$os_gamma)
+  
+  # Check for non-finite survival times
+  if(any(!is.finite(dfs_times))) {
+    stop("OUTCOME_SIMULATION ERROR: DFS times contain non-finite values")
+  }
+  
+  if(any(!is.finite(os_times))) {
+    stop("OUTCOME_SIMULATION ERROR: OS times contain non-finite values")
+  }
+  
+  if(any(dfs_times <= 0)) {
+    stop("OUTCOME_SIMULATION ERROR: DFS times contain non-positive values")
+  }
+  
+  if(any(os_times <= 0)) {
+    stop("OUTCOME_SIMULATION ERROR: OS times contain non-positive values")
+  }
+  
+  # Generate censoring times (administrative censoring)
+  censor_dfs <- runif(nrow(dataset), min = 2, max = 10)
+  censor_os <- runif(nrow(dataset), min = 3, max = 15)
+  
+  # Apply censoring
+  observed_dfs_times <- pmin(dfs_times, censor_dfs)
+  observed_os_times <- pmin(os_times, censor_os)
+  
+  dfs_events <- as.numeric(dfs_times <= censor_dfs)
+  os_events <- as.numeric(os_times <= censor_os)
+  
+  return(list(
+    DFStime = observed_dfs_times,
+    DFS = dfs_events,
+    OStime = observed_os_times,
+    OS = os_events
+  ))
+}
+```
+
+Corrected version: remove variable scaling for some reason. 
+
+```{r}
+simulate_outcomes <- function(dataset, treatment,
+                              hr_treatment_dfs = 1.5,
+                              hr_treatment_os = 1.3,
+                              baseline_models) {
+  
+  if(nrow(dataset) == 0) {
+    stop("OUTCOME_SIMULATION ERROR: Dataset is empty")
+  }
+  
+  if(length(treatment) != nrow(dataset)) {
+    stop("OUTCOME_SIMULATION ERROR: Treatment length does not match dataset rows")
+  }
+  
+  if(any(is.na(treatment))) {
+    stop("OUTCOME_SIMULATION ERROR: Treatment contains NA values")
+  }
+  
+  if(!all(treatment %in% c(0, 1))) {
+    stop("OUTCOME_SIMULATION ERROR: Treatment must be coded 0/1")
+  }
+  
+  if(!is.finite(hr_treatment_dfs) || hr_treatment_dfs <= 0) {
+    stop("OUTCOME_SIMULATION ERROR: Invalid hr_treatment_dfs")
+  }
+  
+  if(!is.finite(hr_treatment_os) || hr_treatment_os <= 0) {
+    stop("OUTCOME_SIMULATION ERROR: Invalid hr_treatment_os")
+  }
+  
+  # Helper: extract coefficient, fail if invalid
+  get_coef <- function(coef_vector, var_name) {
+    if(is.null(coef_vector) || length(coef_vector) == 0) {
+      stop(paste("OUTCOME_SIMULATION ERROR: Coefficient vector is empty for", var_name))
+    }
+    
+    if(!(var_name %in% names(coef_vector))) {
+      return(0)  # okay only if variable truly not in fitted model
+    }
+    
+    coef_val <- coef_vector[var_name]
+    
+    if(is.na(coef_val) || !is.finite(coef_val)) {
+      stop(paste("OUTCOME_SIMULATION ERROR: Invalid coefficient for", var_name))
+    }
+    
+    return(as.numeric(coef_val))
+  }
+  
+  # Initialize linear predictors with treatment effect
+  linear_pred_dfs <- log(hr_treatment_dfs) * treatment
+  linear_pred_os  <- log(hr_treatment_os)  * treatment
+  
+  # Binary covariates
+  binary_vars <- intersect(
+    c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin", "ENE_bin", "PORT_bin"),
+    colnames(dataset)
+  )
+  
+  for(var in binary_vars) {
+    dfs_coef <- get_coef(baseline_models$dfs_coef, var)
+    os_coef  <- get_coef(baseline_models$os_coef, var)
+    
+    linear_pred_dfs <- linear_pred_dfs + dfs_coef * dataset[[var]]
+    linear_pred_os  <- linear_pred_os  + os_coef  * dataset[[var]]
+  }
+  
+  # Continuous covariates: use RAW values to match fitted Cox model
+  cont_vars <- intersect(c("Max_tumor_size", "Total_LN_positive_"), colnames(dataset))
+  
+  for(var in cont_vars) {
+    if(any(is.na(dataset[[var]]))) {
+      stop(paste("OUTCOME_SIMULATION ERROR:", var, "contains NA values"))
+    }
+    if(any(!is.finite(dataset[[var]]))) {
+      stop(paste("OUTCOME_SIMULATION ERROR:", var, "contains non-finite values"))
+    }
+    
+    dfs_coef <- get_coef(baseline_models$dfs_coef, var)
+    os_coef  <- get_coef(baseline_models$os_coef, var)
+    
+    linear_pred_dfs <- linear_pred_dfs + dfs_coef * dataset[[var]]
+    linear_pred_os  <- linear_pred_os  + os_coef  * dataset[[var]]
+  }
+  
+  # Validate linear predictors
+  if(any(!is.finite(linear_pred_dfs))) {
+    stop("OUTCOME_SIMULATION ERROR: DFS linear predictor contains non-finite values")
+  }
+  
+  if(any(!is.finite(linear_pred_os))) {
+    stop("OUTCOME_SIMULATION ERROR: OS linear predictor contains non-finite values")
+  }
+  
+  # Validate Weibull parameters
+  required_params <- c("dfs_lambda", "dfs_gamma", "os_lambda", "os_gamma")
+  missing_params <- required_params[!required_params %in% names(baseline_models)]
+  if(length(missing_params) > 0) {
+    stop(paste("OUTCOME_SIMULATION ERROR: Missing Weibull parameters:",
+               paste(missing_params, collapse = ", ")))
+  }
+  
+  if(!is.finite(baseline_models$dfs_lambda) || baseline_models$dfs_lambda <= 0) {
+    stop("OUTCOME_SIMULATION ERROR: Invalid dfs_lambda")
+  }
+  if(!is.finite(baseline_models$dfs_gamma) || baseline_models$dfs_gamma <= 0) {
+    stop("OUTCOME_SIMULATION ERROR: Invalid dfs_gamma")
+  }
+  if(!is.finite(baseline_models$os_lambda) || baseline_models$os_lambda <= 0) {
+    stop("OUTCOME_SIMULATION ERROR: Invalid os_lambda")
+  }
+  if(!is.finite(baseline_models$os_gamma) || baseline_models$os_gamma <= 0) {
+    stop("OUTCOME_SIMULATION ERROR: Invalid os_gamma")
+  }
+  
+  # Inverse transform sampling from Weibull PH model
+  u_dfs <- runif(nrow(dataset))
+  u_os  <- runif(nrow(dataset))
+  
+  dfs_times <- (-log(u_dfs) / (baseline_models$dfs_lambda * exp(linear_pred_dfs)))^(1 / baseline_models$dfs_gamma)
+  os_times  <- (-log(u_os)  / (baseline_models$os_lambda  * exp(linear_pred_os)))^(1 / baseline_models$os_gamma)
+  
+  if(any(!is.finite(dfs_times)) || any(dfs_times <= 0)) {
+    stop("OUTCOME_SIMULATION ERROR: Invalid DFS times generated")
+  }
+  
+  if(any(!is.finite(os_times)) || any(os_times <= 0)) {
+    stop("OUTCOME_SIMULATION ERROR: Invalid OS times generated")
+  }
+  
+  # Administrative censoring
+  censor_dfs <- runif(nrow(dataset), min = 2, max = 10)
+  censor_os  <- runif(nrow(dataset), min = 3, max = 15)
+  
+  observed_dfs_times <- pmin(dfs_times, censor_dfs)
+  observed_os_times  <- pmin(os_times, censor_os)
+  
+  dfs_events <- as.numeric(dfs_times <= censor_dfs)
+  os_events  <- as.numeric(os_times  <= censor_os)
+  
+  return(list(
+    DFStime = observed_dfs_times,
+    DFS     = dfs_events,
+    OStime  = observed_os_times,
+    OS      = os_events
+  ))
+}
+```
+
+# Causal Inference Methods
+
+Let's try to implement the three methods.
+
+1) Propensity score
+
+2) IPTW
+
+3) Entropy Balancing
+
+ATE: Average Treatment Effect — effect if everyone vs no one treated
+ATT: Average Treatment Effect in the Treated — effect among engrafters specifically 
+ATO: Average Treatment Effect in the Overlap — downweights extreme PS, most stable
+
+Let's focus on entropy balancing first. Using the WeightIt package we  use estimand = "ATT". This essentially says: "I want to know what happened to the people who actually got the treatment, compared to a version of them that didn't." 
+
+If we use estimand = "ATE" then this is saying "I want to know the effect if everyone is treated vs if everyone was not treated". The ATT is more focused on the treated effect for the treated population. 
+
+Once we have the weights from the causal methods, we can use this in weighted Cox models on our treatments. 
+```{r}
+bal_formula <- as.formula(paste("Treatment ~", paste(pred.vars.processed, 
+                                                     collapse = " + ")))
+entropy_ws_att <- WeightIt::weightit(
+  bal_formula,
+  data = data,
+  method = "ebal",
+  estimand = "ATT",
+  moments = 1,
+  int = FALSE,
+  missing = "ind"
+)
+
+fit_entropy_os <- coxph(
+  Surv(OStime, OS) ~ Treatment, 
+  data = data, 
+  weights = entropy_ws_att$weights,
+)
+
+summary(fit_entropy_os)
+
+# Compare to no weights
+fit_os <- coxph(
+  Surv(OStime, OS) ~ Treatment, 
+  data = data
+)
+summary(fit_os)
+```
+# Assess entropy balancing 
+
+```{r}
+raw_weights <- entropy_ws_att$weights
+weight_min <- min(raw_weights)
+weight_max <- max(raw_weights)
+weight_mean <- mean(raw_weights)
+weight_ratio <- weight_max / weight_min
+weight_range_ratio <- weight_max / weight_mean
+
+# We can look at the Kaplan Meier plots for both:
+s_unweighted <- survfit(Surv(OStime, OS) ~ Treatment, data = data)
+s_weighted <- survfit(Surv(OStime, OS) ~ Treatment, data = data, weights = entropy_ws_att$weights)
+
+
+ggsurvplot(
+  s_unweighted, 
+  data = data,
+  risk.table = TRUE,
+  pval = TRUE,
+  conf.int = TRUE,
+  title = "Unweighted (Raw) Survival",
+  palette = c("#E74C3C", "#2ECC71"),
+  ggtheme = theme_minimal()
+)
+
+ggsurvplot(
+  s_weighted, 
+  data = data,
+  risk.table = TRUE,
+  pval = TRUE,
+  conf.int = TRUE,
+  title = "Weighted (Entropy Balancing) Survival",
+  palette = c("#E74C3C", "#2ECC71"),
+  ggtheme = theme_minimal()
+)
+
+love.plot(entropy_ws_att, 
+          threshold = .1, # The "gold standard" balance limit
+          abs = TRUE, 
+          var.order = "unadjusted", 
+          line = TRUE, 
+          stars = "raw")  
+
+```
+Covariate balance was assessed using Absolute Standardized Mean Differences (ASMD). Entropy balancing successfully achieved perfect balance (ASMD = 0) across all included covariates, including nodal status and tumor size, effectively creating a balanced pseudo-population for the ATT estimate.
+
+We can also look at April's method of assessment:
+
+```{r}
+calculate_smd <- function(dataset, treatment_var = "Treatment", 
+                         covariate_vars = NULL, 
+                         weights = NULL) {
+  # If no covariate variables specified, try to use available predictors
+  if(is.null(covariate_vars)) {
+    all_pred_vars <- c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin", "ENE_bin", "PORT_bin", "Max_tumor_size", "Total_LN_positive_")
+    covariate_vars <- intersect(all_pred_vars, colnames(dataset))
+  }
+  
+  # If no weights provided, use equal weights
+  if(is.null(weights)) {
+    weights <- rep(1, nrow(dataset))
+  }
+  # ✅ Enhanced validation
+  if(length(weights) != nrow(dataset)) {
+    stop(paste("Weight vector length mismatch:", length(weights), "vs", nrow(dataset)))
+  }
+  
+  if(!treatment_var %in% colnames(dataset)) {
+    stop(paste("Treatment variable", treatment_var, "not found in dataset"))
+  }
+  
+  treated <- dataset[[treatment_var]] == 1
+  control <- dataset[[treatment_var]] == 0
+  # ✅ Check for sufficient sample sizes
+  if(sum(treated) < 5 || sum(control) < 5) {
+    stop(paste("Insufficient sample sizes: treated =", sum(treated), ", control =", sum(control)))
+  }
+  smd_results <- data.frame(
+    variable = covariate_vars,
+    smd_unweighted = NA,
+    smd_weighted = NA,
+    stringsAsFactors = FALSE
+  )
+  # Very weird way to code this just use length(covariate_vars)
+  for(i in seq_along(covariate_vars)) {
+    var <- covariate_vars[i]
+    
+    if(!var %in% colnames(dataset)) {
+      smd_results$smd_unweighted[i] <- NA
+      smd_results$smd_weighted[i] <- NA
+      next
+    }
+    
+    var_data <- dataset[[var]]
+    
+    # Remove missing values
+    complete_idx <- !is.na(var_data)
+    var_complete <- var_data[complete_idx]
+    treated_complete <- treated[complete_idx]
+    control_complete <- control[complete_idx]
+    weights_complete <- weights[complete_idx]
+    
+    if(sum(treated_complete) == 0 || sum(control_complete) == 0) {
+      smd_results$smd_unweighted[i] <- NA
+      smd_results$smd_weighted[i] <- NA
+      next
+    }
+    
+# ✅ Enhanced unweighted SMD calculation
+    tryCatch({
+      mean_treated <- mean(var_complete[treated_complete])
+      mean_control <- mean(var_complete[control_complete])
+      var_treated <- var(var_complete[treated_complete])
+      var_control <- var(var_complete[control_complete])
+      
+      # Handle zero variance case
+      if(var_treated == 0 && var_control == 0) {
+        smd_results$smd_unweighted[i] <- 0
+      } else {
+        pooled_sd <- sqrt((var_treated + var_control) / 2)
+        if(pooled_sd == 0) {
+          smd_results$smd_unweighted[i] <- 0
+        } else {
+          smd_results$smd_unweighted[i] <- (mean_treated - mean_control) / pooled_sd
+        }
+      }
+    }, error = function(e) {
+      smd_results$smd_unweighted[i] <- NA
+    })
+    
+    # ✅ Enhanced weighted SMD calculation
+    tryCatch({
+      weights_treated <- weights_complete[treated_complete]
+      weights_control <- weights_complete[control_complete]
+      
+      # Weighted means
+      mean_treated_wt <- sum(var_complete[treated_complete] * weights_treated) / sum(weights_treated)
+      mean_control_wt <- sum(var_complete[control_complete] * weights_control) / sum(weights_control)
+      
+      # Weighted variances
+      var_treated_wt <- sum(weights_treated * (var_complete[treated_complete] - mean_treated_wt)^2) / sum(weights_treated)
+      var_control_wt <- sum(weights_control * (var_complete[control_complete] - mean_control_wt)^2) / sum(weights_control)
+      
+      # Handle zero variance case
+      if(var_treated_wt == 0 && var_control_wt == 0) {
+        smd_results$smd_weighted[i] <- 0
+      } else {
+        pooled_sd_wt <- sqrt((var_treated_wt + var_control_wt) / 2)
+        if(pooled_sd_wt == 0) {
+          smd_results$smd_weighted[i] <- 0
+        } else {
+          smd_results$smd_weighted[i] <- (mean_treated_wt - mean_control_wt) / pooled_sd_wt
+        }
+      }
+    }, error = function(e) {
+      smd_results$smd_weighted[i] <- NA
+    })
+  }
+  
+  return(smd_results)
+}
+
+smd_report <- calculate_smd(
+  dataset = data, 
+  treatment_var = "Treatment", 
+  covariate_vars = pred.vars.processed,
+  weights = entropy_ws_att$weights
+)
+
+smd_report
+```
+
+We see very similar values found in our love plot:
+```{r}
+stats <- cobalt::bal.tab(entropy_ws_att, un = TRUE)
+
+# Access the balance data frame directly
+stats$Balance
+```
+
+Interestingly the SMD is very close to 0 with the weights - showing that they were successful. 
+
+Looking at other causal methods...
+
+# IPTW 
+```{r}
+iptw_formula <- as.formula(paste("Treatment ~", paste(pred.vars.processed, 
+                                                     collapse = " + ")))
+ws_iptw_att <- WeightIt::weightit(
+  iptw_formula,
+  data = data,
+  method = "glm",
+  estimand = "ATT",
+  link = "logit"
+)
+
+# fit onto cox model
+fit_IPTW_os <- coxph(
+  Surv(OStime, OS) ~ Treatment, 
+  data = data, 
+  weights = ws_iptw_att$weights,
+)
+
+summary(fit_IPTW_os)
+```
+
+```{r, warning=FALSE}
+# We can look at the Kaplan Meier plots for both:
+s_unweighted <- survfit(Surv(OStime, OS) ~ Treatment, data = data)
+s_weighted_IPTW <- survfit(Surv(OStime, OS) ~ Treatment, data = data, weights = ws_iptw_att$weights)
+
+ggsurvplot(
+  s_unweighted, 
+  data = data,
+  risk.table = TRUE,
+  pval = TRUE,
+  conf.int = TRUE,
+  title = "Unweighted (Raw) Survival",
+  palette = c("#E74C3C", "#2ECC71"),
+  ggtheme = theme_minimal()
+)
+ggsurvplot(
+  s_weighted_IPTW, 
+  data = data,
+  risk.table = TRUE,
+  pval = TRUE,
+  conf.int = TRUE,
+  title = "Weighted (IPTW) Survival",
+  palette = c("#E74C3C", "#2ECC71"),
+  ggtheme = theme_minimal()
+)
+
+love.plot(ws_iptw_att, 
+          threshold = .1, # The "gold standard" balance limit
+          abs = TRUE, 
+          var.order = "unadjusted", 
+          line = TRUE, 
+          stars = "raw")  
+
+```
+The third method was propensity score - however the implementation of it is very similar to IPTW. It is a manually version of it. We repurpose this from April's code.
+
+```{r, echo=FALSE}
+ps_formula <- as.formula(paste("Treatment ~", paste(pred.vars.processed, 
+                                                     collapse = " + ")))
+
+# Propensity model through binomial
+ps_model <- glm(ps_formula, data = data, family = binomial())
+ps_scores <- rep(NA, nrow(data))
+prediction_data <- data[, c(pred.vars.processed, "Treatment"), drop = FALSE]
+pred_complete <- complete.cases(prediction_data)
+
+# Grab the propensity scores
+prediction_data$ps_scores[pred_complete] <- predict(ps_model, 
+                                     newdata = prediction_data[pred_complete, , drop = FALSE], 
+                                     type = "response")
+treated_mask <- prediction_data$Treatment == 1
+control_mask <- prediction_data$Treatment == 0
+
+# Treated cases has weights 1 and control cases has propensity score weights
+prediction_data$weights <- rep(1, nrow(prediction_data))
+prediction_data$weights[control_mask] <- 
+  prediction_data$ps_scores[control_mask] / (1-prediction_data$ps_scores[control_mask]) 
+
+# fit onto cox model
+fit_PS_os <- coxph(
+  Surv(OStime, OS) ~ Treatment, 
+  data = data, 
+  weights = prediction_data$weights,
+)
+summary(fit_PS_os)
+```
+We can compare the WeightIT results to our PS implementation.
+```{r}
+prediction_data$WeightIT_weights <- ws_iptw_att$weights
+all.equal(prediction_data$weights, prediction_data$WeightIT_weights, tolerance = 1e-6)
+```
+
+They are equivalent for our data! Hence April's IPTW and PS methods are equivalent. We can double check with April's exact function. April's function that is used to compute the three causal methods is the `ff.att.analysis` function. It returns the survival model that we have been producing. 
+
+```{r}
+# Analysis function - NO FALLBACKS, direct errors
+
+ff.att.analysis<- function(dataset, 
+                           outcome_type = "DFS", 
+                           method = "ps", 
+                           pred_vars = NULL,
+                           include_balance = FALSE,
+                           include_diagnostics = TRUE,
+                           weight_diagnostics = FALSE) {
+  
+  # Define time and event variables based on outcome type
+  if(outcome_type == "DFS") {
+    time_var <- "DFStime"
+    event_var <- "DFS"
+  } else if(outcome_type == "OS") {
+    time_var <- "OStime"
+    event_var <- "OS"
+  } else {
+    stop("FF.ATT.ANALYSIS ERROR: outcome_type must be 'DFS' or 'OS'")
+  }
+  
+  # Validate required columns
+  required_cols <- c("Treatment", time_var, event_var)
+  missing_cols <- required_cols[!required_cols %in% colnames(dataset)]
+  if(length(missing_cols) > 0) {
+    stop(paste("FF.ATT.ANALYSIS ERROR: Missing required columns:", paste(missing_cols, collapse = ", ")))
+  }
+  
+  # Define available predictor variables
+  all_pred_vars <- c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin", "ENE_bin", "PORT_bin", "Max_tumor_size", "Total_LN_positive_")
+  
+  if(is.null(pred_vars)) {
+    available_vars <- intersect(all_pred_vars, colnames(dataset))
+  } else {
+    available_vars <- intersect(pred_vars, colnames(dataset))
+  }
+  
+  if(length(available_vars) < 2) {
+    stop(paste("FF.ATT.ANALYSIS ERROR: Need at least 2 predictor variables. Available:", paste(available_vars, collapse = ", ")))
+  }
+  
+  # Clean data - remove observations with missing treatment or outcome
+  clean_indices <- !is.na(dataset$Treatment) & !is.na(dataset[[time_var]]) & !is.na(dataset[[event_var]]) & 
+                   dataset[[time_var]] > 0 & dataset[[event_var]] %in% c(0, 1)
+  
+  if(sum(clean_indices) < 20) {
+    stop(paste("FF.ATT.ANALYSIS ERROR: Insufficient clean data:", sum(clean_indices), "< 20"))
+  }
+  
+  dataset <- dataset[clean_indices, ]
+  
+  # Check treatment distribution
+  treat_counts <- table(dataset$Treatment)
+  if(length(treat_counts) != 2 || min(treat_counts) < 5) {
+    stop(paste("FF.ATT.ANALYSIS ERROR: Insufficient treatment distribution:", paste(treat_counts, collapse = ", ")))
+  }
+  
+  # Prepare balance data (complete cases only for balancing)
+    balance_data <- dataset[complete.cases(dataset[, c("Treatment", available_vars), drop = FALSE]), ]
+  
+  if(nrow(balance_data) < 20) {
+    stop("FF.ATT.ANALYSIS ERROR: Insufficient complete cases for balancing")
+  }
+  
+  # REFINED ENTROPY BALANCING IMPLEMENTATION
+  # Progressive Tolerance Relaxation + Conservative Weight Trimming
+  if(method == "ebal") {
+  cat("Starting Enhanced EBAL with WeightIt...\n")
+  
+  # Step 1: Create balance formula
+  balance_formula <- as.formula(paste("Treatment ~", paste(available_vars, collapse = " + ")))
+  
+  # Step 2: Data quality checks (fail immediately if issues)
+  if(nrow(balance_data) < 50) {
+    stop(paste("EBAL ERROR: Insufficient sample size for EBAL:", nrow(balance_data), "< 50 required"))
+  }
+  
+  # Check treatment distribution
+  treat_dist <- table(balance_data$Treatment)
+  if(min(treat_dist) < 10) {
+    stop(paste("EBAL ERROR: Insufficient treatment group sizes:", paste(treat_dist, collapse = ", "), "- need at least 10 per group"))
+  }
+  
+  # Check for constant variables (EBAL requirement)
+  var_check <- sapply(available_vars, function(var) {
+    var_values <- balance_data[[var]]
+    var_variance <- var(var_values, na.rm = TRUE)
+    return(var_variance > 1e-8)
+  })
+  
+  if(!all(var_check)) {
+    constant_vars <- available_vars[!var_check]
+    stop(paste("EBAL ERROR: Variables with zero/near-zero variance detected:", paste(constant_vars, collapse = ", ")))
+  }
+  
+  # Check for perfect correlation (causes rank deficiency)
+  X_matrix <- as.matrix(balance_data[, available_vars, drop = FALSE])
+  if(qr(X_matrix)$rank < ncol(X_matrix)) {
+    stop("EBAL ERROR: Design matrix is rank deficient - perfect correlation between variables detected")
+  }
+  
+  # Step 3: Run Enhanced WeightIt EBAL (NO FALLBACKS)
+  tryCatch({
+    
+    # Enhanced WeightIt with EBAL - optimized settings
+    ws <- WeightIt::weightit(
+      balance_formula, 
+      data = balance_data, 
+      method = "ebal", 
+      estimand = "ATT",
+      stabilize = TRUE,        # Add weight stabilization
+      moments = 1,             # Balance means only (not variances) - more stable
+      int = FALSE,             # No interaction terms - reduces complexity
+      missing = "ind"          # Handle missing data properly
+    )
+    
+    # Step 4: Critical weight validation (fail if invalid)
+    if(is.null(ws$weights) || length(ws$weights) == 0) {
+      stop("EBAL ERROR: WeightIt returned NULL weights")
+    }
+    
+    if(any(is.na(ws$weights))) {
+      na_count <- sum(is.na(ws$weights))
+      stop(paste("EBAL ERROR: WeightIt produced", na_count, "NA weights"))
+    }
+    
+    if(any(!is.finite(ws$weights))) {
+      inf_count <- sum(!is.finite(ws$weights))
+      stop(paste("EBAL ERROR: WeightIt produced", inf_count, "non-finite weights"))
+    }
+    
+    if(any(ws$weights <= 0)) {
+      neg_count <- sum(ws$weights <= 0)
+      stop(paste("EBAL ERROR: WeightIt produced", neg_count, "non-positive weights"))
+    }
+    
+    # Step 5: Weight distribution diagnostics
+    raw_weights <- ws$weights
+    weight_min <- min(raw_weights)
+    weight_max <- max(raw_weights)
+    weight_mean <- mean(raw_weights)
+    weight_ratio <- weight_max / weight_min
+    weight_range_ratio <- weight_max / weight_mean
+    
+    cat("EBAL Weight Statistics:\n")
+    cat("  Range:", round(weight_min, 4), "to", round(weight_max, 4), "\n")
+    cat("  Mean:", round(weight_mean, 4), "\n")
+    cat("  Max/Min ratio:", round(weight_ratio, 2), "\n")
+    cat("  Max/Mean ratio:", round(weight_range_ratio, 2), "\n")
+    
+    # Step 6: Conservative weight trimming (ONLY if extremely unbalanced)
+    # Threshold: Only trim if weights are extremely problematic
+    if(weight_ratio > 100 || weight_range_ratio > 50) {
+      cat("Applying conservative weight trimming...\n")
+      
+      # Conservative trimming - only trim extreme outliers
+      trim_upper <- quantile(raw_weights, 0.98)  # More conservative than 0.95
+      trim_lower <- quantile(raw_weights, 0.02)
+      
+      trimmed_weights <- pmax(trim_lower, pmin(raw_weights, trim_upper))
+      
+      # Validate trimming didn't break everything
+      if(any(trimmed_weights <= 0) || any(!is.finite(trimmed_weights))) {
+        stop("EBAL ERROR: Weight trimming produced invalid weights")
+      }
+      
+      final_weights_ebal <- trimmed_weights
+      
+      # Report trimming impact
+      trim_count <- sum(raw_weights != trimmed_weights)
+      cat("Trimmed", trim_count, "weights. New range:", 
+          round(min(trimmed_weights), 4), "to", round(max(trimmed_weights), 4), "\n")
+      
+    } else {
+      cat("Weight distribution acceptable - no trimming applied\n")
+      final_weights_ebal <- raw_weights
+    }
+    
+    # Step 7: Map weights back to full dataset
+    final_weights <- rep(1, nrow(dataset))
+    
+    if(nrow(balance_data) == nrow(dataset)) {
+      # Perfect match - direct assignment
+      final_weights <- final_weights_ebal
+    } else {
+      # Map back to complete cases only
+      complete_indices <- complete.cases(dataset[, c("Treatment", available_vars), drop = FALSE])
+      
+      if(sum(complete_indices) != nrow(balance_data)) {
+        stop("EBAL ERROR: Mismatch in complete cases mapping")
+      }
+      
+      final_weights[complete_indices] <- final_weights_ebal
+    }
+    
+    # Step 8: Final comprehensive validation
+    if(length(final_weights) != nrow(dataset)) {
+      stop(paste("EBAL ERROR: Final weight vector length mismatch:", length(final_weights), "vs", nrow(dataset)))
+    }
+    
+    if(any(!is.finite(final_weights))) {
+      stop("EBAL ERROR: Final weight vector contains non-finite values")
+    }
+    
+    if(any(final_weights <= 0)) {
+      stop("EBAL ERROR: Final weight vector contains non-positive values")
+    }
+    
+    # Success message
+    cat("✓ Enhanced EBAL completed successfully\n")
+    cat("✓ Final weights: min =", round(min(final_weights), 4), 
+        ", max =", round(max(final_weights), 4), "\n")
+    cat("✓ Effective sample size:", round(sum(final_weights)), "\n")
+    
+  }, error = function(e) {
+    # NO FALLBACKS - Direct error propagation with enhanced information
+    error_msg <- paste("ENHANCED EBAL FAILED:", e$message)
+    
+    # Add diagnostic information to help debug
+    error_msg <- paste0(error_msg, "\n",
+                       "  Sample size: ", nrow(balance_data), "\n",
+                       "  Variables: ", paste(available_vars, collapse = ", "), "\n",
+                       "  Treatment distribution: ", paste(table(balance_data$Treatment), collapse = ", "))
+    
+    stop(error_msg)
+  })
+  
+}
+    else if(method == "ps") {
+    cat("Starting July 27th Style PS Method...\n")
+  
+  # ===================================================================
+  # STEP 1: SIMPLE DATA PREPARATION (Like July 27th)
+  # ===================================================================
+  
+  # Keep it simple - only remove subjects with missing Treatment or outcomes
+  analysis_data <- dataset[!is.na(dataset$Treatment) & 
+                          !is.na(dataset[[time_var]]) & 
+                          !is.na(dataset[[event_var]]) &
+                          dataset[[time_var]] > 0, ]
+  
+  if(nrow(analysis_data) < 20) {
+    stop("Insufficient data for PS analysis")
+  }
+  
+  # Check treatment distribution
+  treat_counts <- table(analysis_data$Treatment)
+  if(length(treat_counts) != 2 || min(treat_counts) < 5) {
+    stop(paste("Insufficient treatment distribution:", paste(treat_counts, collapse = ", ")))
+  }
+  
+  if(include_diagnostics) {
+    cat("✅ Using", nrow(analysis_data), "subjects for PS analysis\n")
+    cat("  Treatment distribution:", paste(treat_counts, collapse = ", "), "\n")
+  }
+  
+  # ===================================================================
+  # STEP 2: DIRECT PS MODEL FITTING (Like Sophie's Approach)
+  # ===================================================================
+  
+  # Use available variables, handle missing predictors by complete case
+  usable_vars <- intersect(available_vars, colnames(analysis_data))
+  
+  if(length(usable_vars) < 2) {
+    stop("Need at least 2 predictor variables for PS model")
+  }
+  
+  # Create complete case data for PS model
+  ps_vars <- c("Treatment", usable_vars)
+  ps_data <- analysis_data[, ps_vars, drop = FALSE]
+  complete_cases <- complete.cases(ps_data)
+  
+  if(sum(complete_cases) < 15) {
+    stop("Insufficient complete cases for PS model")
+  }
+  
+  ps_model_data <- ps_data[complete_cases, ]
+  
+  if(include_diagnostics) {
+    cat("✅ PS model data: n =", nrow(ps_model_data), "with", length(usable_vars), "predictors\n")
+  }
+  
+  # ===================================================================
+  # STEP 3: FIT LOGISTIC REGRESSION MODEL (Direct, Like July 27th)
+  # ===================================================================
+  
+  ps_formula <- as.formula(paste("Treatment ~", paste(usable_vars, collapse = " + ")))
+  
+  # Fit the model
+  ps_model <- glm(ps_formula, data = ps_model_data, family = binomial())
+  
+  if(!ps_model$converged) {
+    stop("PS logistic regression did not converge")
+  }
+  
+  # ===================================================================
+  # STEP 4: CALCULATE PROPENSITY SCORES (Simple Prediction)
+  # ===================================================================
+  
+  # Predict for all subjects with complete predictor data
+  prediction_data <- analysis_data[, usable_vars, drop = FALSE]
+  pred_complete <- complete.cases(prediction_data)
+  
+  if(sum(pred_complete) < 10) {
+    stop("Insufficient complete cases for PS prediction")
+  }
+  
+  # Calculate PS scores
+  ps_scores <- rep(NA, nrow(analysis_data))
+  ps_scores[pred_complete] <- predict(ps_model, 
+                                     newdata = prediction_data[pred_complete, , drop = FALSE], 
+                                     type = "response")
+  
+  # Basic PS validation
+  valid_ps <- ps_scores[!is.na(ps_scores)]
+  if(length(valid_ps) == 0) {
+    stop("No valid propensity scores calculated")
+  }
+  
+  ps_min <- min(valid_ps)
+  ps_max <- max(valid_ps)
+  
+  if(include_diagnostics) {
+    cat("✅ PS calculation completed\n")
+    cat("  Valid PS scores:", length(valid_ps), "out of", nrow(analysis_data), "\n")
+    cat("  PS range:", round(ps_min, 3), "to", round(ps_max, 3), "\n")
+  }
+  
+  # ===================================================================
+  # STEP 5: SIMPLE ATT WEIGHT CALCULATION (Like July 27th)
+  # ===================================================================
+  
+  # Initialize weights as 1
+  weights <- rep(1, nrow(analysis_data))
+  
+  # Calculate ATT weights only where we have valid PS scores
+  has_ps <- !is.na(ps_scores)
+  has_treatment <- !is.na(analysis_data$Treatment)
+  usable_indices <- has_ps & has_treatment
+  
+  if(sum(usable_indices) < 10) {
+    stop("Insufficient subjects for weight calculation")
+  }
+  
+  # ATT weights: Treated = 1, Control = PS/(1-PS)
+  treated_mask <- usable_indices & (analysis_data$Treatment == 1)
+  control_mask <- usable_indices & (analysis_data$Treatment == 0)
+  
+  # Set treated weights to 1
+  weights[treated_mask] <- 1
+  
+  # Calculate control weights
+  control_ps <- ps_scores[control_mask]
+  
+  # Handle extreme PS values (simple approach)
+  control_ps[control_ps >= 0.98] <- 0.98
+  control_ps[control_ps <= 0.02] <- 0.02
+  
+  # Calculate control weights
+  control_weights <- control_ps / (1 - control_ps)
+  weights[control_mask] <- control_weights
+  
+  # ===================================================================
+  # STEP 6: SIMPLE WEIGHT TRIMMING (Conservative, Like July 27th)
+  # ===================================================================
+  
+  # Basic weight statistics
+  weight_max <- max(weights)
+  weight_min <- min(weights)
+  
+  if(include_diagnostics) {
+    cat("✅ Weight statistics:\n")
+    cat("  Range:", round(weight_min, 3), "to", round(weight_max, 3), "\n")
+    cat("  Max/Min ratio:", round(weight_max/weight_min, 2), "\n")
+  }
+  
+  # Conservative trimming (only if really needed)
+  if(weight_max > 20) {
+    trim_threshold <- min(20, quantile(weights, 0.95))
+    weights <- pmin(weights, trim_threshold)
+    
+    if(include_diagnostics) {
+      cat("  Applied conservative trimming at", round(trim_threshold, 2), "\n")
+    }
+  }
+  
+  # ===================================================================
+  # STEP 7: MAP WEIGHTS TO ORIGINAL DATASET (Simple Mapping)
+  # ===================================================================
+  
+  final_weights <- rep(1, nrow(dataset))
+  
+  # Map weights back to original dataset
+  if(nrow(analysis_data) == nrow(dataset)) {
+    # No subjects were removed - direct assignment
+    final_weights <- weights
+  } else {
+    # Map back using row indices
+    original_indices <- which(!is.na(dataset$Treatment) & 
+                             !is.na(dataset[[time_var]]) & 
+                             !is.na(dataset[[event_var]]) &
+                             dataset[[time_var]] > 0)
+    
+    if(length(original_indices) == nrow(analysis_data)) {
+      final_weights[original_indices] <- weights
+    } else {
+      # Fallback: use weights where possible
+      final_weights[1:min(length(weights), length(final_weights))] <- weights[1:min(length(weights), length(final_weights))]
+    }
+  }
+  
+  # Final validation
+  if(any(!is.finite(final_weights)) || any(final_weights <= 0)) {
+    stop("Invalid final weights produced")
+  }
+  
+  if(include_diagnostics) {
+    effective_n <- sum(final_weights)
+    cat("✅ July 27th Style PS completed successfully\n")
+    cat("  Effective sample size:", round(effective_n), "\n")
+    cat("  Final weight range:", round(min(final_weights), 3), "to", round(max(final_weights), 3), "\n")
+  }
+  }  else if(method == "iptw") {
+    # JULY 27TH APPROACH: Use full dataset directly  
+  balance_formula <- as.formula(paste("Treatment ~", paste(available_vars, collapse = " + ")))
+  
+  # NO SUBSETTING - use full dataset like July 27th
+  ws <- WeightIt::weightit(balance_formula, data = dataset, method = "glm", estimand = "ATT")
+  
+  # DIRECT assignment - no complex mapping
+  final_weights <- ws$weights
+    
+  } else {
+    stop("Method must be 'ps', 'ebal', or 'iptw'")
+  }
+  
+  # FINAL COMPREHENSIVE WEIGHT VALIDATION before Cox model
+  if(any(!is.finite(final_weights))) {
+    invalid_count <- sum(!is.finite(final_weights))
+    stop(paste("FF.ATT.ANALYSIS ERROR:", invalid_count, "non-finite weights in final weight vector"))
+  }
+  
+  if(any(final_weights <= 0)) {
+    negative_count <- sum(final_weights <= 0)
+    stop(paste("FF.ATT.ANALYSIS ERROR:", negative_count, "non-positive weights in final weight vector"))
+  }
+  
+  if(length(final_weights) != nrow(dataset)) {
+    stop(paste("FF.ATT.ANALYSIS ERROR: Weight vector length mismatch:", length(final_weights), "vs", nrow(dataset)))
+  }
+  
+  if(include_diagnostics) {
+    cat("✓ Final weight validation passed\n")
+    cat("  All", length(final_weights), "weights are finite and positive\n")
+    cat("  Weight range:", round(min(final_weights), 4), "to", round(max(final_weights), 4), "\n")
+  }
+  
+  # Fit Cox model with weights
+  surv_formula <- as.formula(paste("Surv(", time_var, ",", event_var, ") ~ Treatment"))
+  
+  coxmodel <- survival::coxph(surv_formula, data = dataset, 
+                             weights = final_weights, 
+                             robust = TRUE)
+  
+  # Extract results
+  coef_val <- coef(coxmodel)[1]
+  var_val <- coxmodel$var[1,1]
+  
+  if(is.na(coef_val) || is.na(var_val) || var_val <= 0) {
+    stop("Cox model produced invalid results")
+  }
+  
+  se_val <- sqrt(var_val)
+  hr_val <- exp(coef_val)
+  z_stat <- coef_val / se_val
+  pvalue_val <- 2 * (1 - pnorm(abs(z_stat)))
+  ci_lower_val <- exp(coef_val - 1.96 * se_val)
+  ci_upper_val <- exp(coef_val + 1.96 * se_val)
+  
+  # Return results
+  results <- list(
+    hr = hr_val,
+    coef = coef_val,
+    se = se_val,
+    pvalue = pvalue_val,
+    ci_lower = ci_lower_val,
+    ci_upper = ci_upper_val,
+    log_hr = coef_val,
+    method = method,
+    balance_assessment = if(include_balance) {
+  tryCatch({
+    baseline_smd <- calculate_smd(balance_data, covariate_vars = available_vars)
+    weighted_smd <- calculate_smd(balance_data, covariate_vars = available_vars, 
+                                 weights = final_weights[1:nrow(balance_data)])
+    
+    balance_results <- data.frame(
+      variable = baseline_smd$variable,
+      smd_unweighted = baseline_smd$smd_unweighted,
+      smd_weighted = weighted_smd$smd_weighted
+    )
+    
+    list(
+      good_balance_pct = sum(abs(balance_results$smd_weighted) < 0.1) / nrow(balance_results) * 100,
+      max_abs_smd = max(abs(balance_results$smd_weighted)),
+      smd_results = balance_results
+    )
+  }, error = function(e) NULL)
+} else {
+    NULL
+  },
+    weights_summary = list(
+      min = min(final_weights),
+      max = max(final_weights),
+      mean = mean(final_weights),
+      effective_n = sum(final_weights)
+    )
+  )
+  # DEBUG: Add condition tracking to balance assessment
+if(include_balance && !is.null(final_weights)) {
+  # ... existing balance calculation code ...
+  
+  # ADD THIS DEBUG SECTION:
+  if(!is.null(baseline_smd) && !is.null(weighted_smd)) {
+    
+    # Create a unique identifier for this specific analysis
+    analysis_id <- paste(
+      method, 
+      nrow(balance_data), 
+      round(sum(final_weights[1:nrow(balance_data)]), 2),
+      round(sum(baseline_smd$smd_unweighted, na.rm = TRUE), 4),
+      sep="_"
+    )
+    
+    cat("🔍 BALANCE DEBUG - Analysis ID:", analysis_id, "\n")
+    cat("   Method:", method, "| Data rows:", nrow(balance_data), "\n")
+    cat("   Weight sum:", round(sum(final_weights[1:nrow(balance_data)]), 2), "\n")
+    cat("   SMD before sum:", round(sum(baseline_smd$smd_unweighted, na.rm = TRUE), 4), "\n")
+    cat("   SMD after:", paste(round(weighted_smd$smd_weighted, 3), collapse = ","), "\n")
+    
+    balance_results <- data.frame(
+      variable = baseline_smd$variable,
+      smd_unweighted = baseline_smd$smd_unweighted,
+      smd_weighted = weighted_smd$smd_weighted,
+      analysis_id = analysis_id  # ADD THIS LINE
+    )
+    
+    list(
+      good_balance_pct = sum(abs(balance_results$smd_weighted) < 0.1) / nrow(balance_results) * 100,
+      max_abs_smd = max(abs(balance_results$smd_weighted)),
+      smd_results = balance_results,
+      analysis_id = analysis_id  # ADD THIS LINE
+    )
+  }
+}
+  return(results)
+}
+
+```
+
+```{r}
+iptw_model <- ff.att.analysis(data, outcome_type = "OS", method="iptw")
+iptw_model
+```
+This is the same model we had earlier. Now looking at the manual propensity score method:
+```{r}
+ps_model <- ff.att.analysis(data, outcome_type = "OS", method="ps")
+ps_model
+```
+Once again - they are identical. Comparing these two methods does not make sense. If we want to include a third method similar to IPTW/propensity scores we can do propensity score matching. Propensity score matching pairs each treated unit with the most similar control unit(s) based on their propensity score, rather than reweighting. There are a few key things to recognize in terms of matching:
+
+(1) Matching ratio - how many control observations are matched to treatment observations
+(2) Matching algorithm - nearest neighbor? optimize distance? What even is the distance metric? 
+(3) Replacement or not? Remove any unmatched observations? 
+
+Under ATT matching is intuitive - we match controls to the treated so the matched sample estimates the effect in the treated group directly. 
+```{r}
+# --- Step 1: Match ---
+ps_formula <- as.formula(paste("Treatment ~", paste(pred.vars.processed, 
+                                                     collapse = " + ")))
+match_out <- matchit(ps_formula,
+                     data     = data,
+                     method   = "nearest",   # greedy nearest neighbour
+                     distance = "glm",       # logistic PS
+                     ratio    = 1,           # 1:1
+                     replace  = FALSE)       # without replacement
+
+summary(match_out)
+
+```
+
+The MatchIt summary returns 3 data-frames. The first is just means of the covariates in the unmatched/raw data. For example, Age_DX_bin under Means Treated is 0.4899. This means when looking at the treatment group, the average of this variable is 0.4899. The second dataset is the same but now looking at the distribution after the matching was conducted. The third dataset just shows how many were matched or not. 
+```{r}
+
+# --- Step 2: Extract matched dataset ---
+matched_data <- match.data(match_out)
+
+# --- Step 3: Fit Cox on matched data ---
+fit_match_os <- coxph(Surv(OStime, OS) ~ Treatment,
+                      data    = matched_data,
+                      weights = weights,      # matchit provides these
+                      cluster = subclass,     # accounts for matched pairs in SE
+                      robust  = TRUE)
+
+summary(fit_match_os)
+```
+
+```{r}
+# Diagnostics plots
+# Jitter plot of PS by treatment and match status
+plot(match_out, type = "jitter", interactive = FALSE)
+
+# Histogram overlay
+plot(match_out, type = "histogram")
+
+s_matched <- survfit(Surv(OStime, OS) ~ Treatment, 
+                     data    = matched_data,
+                     weights = weights)
+
+ggsurvplot(s_matched,
+           data       = matched_data,
+           risk.table = TRUE,
+           pval       = TRUE,
+           conf.int   = TRUE,
+           title      = "Matched Survival (ATT)",
+           palette    = c("#E74C3C", "#2ECC71"),
+           ggtheme    = theme_minimal()) |> suppressWarnings()
+```
+Interestingly - the matched treated kept those with high propensity scores. We can check the love-plots of all three methods here.
+
+```{r}
+# Entropy 
+love.plot(entropy_ws_att, 
+          threshold = .1, # The "gold standard" balance limit
+          abs = TRUE, 
+          var.order = "unadjusted", 
+          line = TRUE, 
+          stars = "raw",
+          title = "Love Plot (Entropy Balancing)")  
+
+# IPTW
+love.plot(ws_iptw_att, 
+          threshold = .1, # The "gold standard" balance limit
+          abs = TRUE, 
+          var.order = "unadjusted", 
+          line = TRUE, 
+          stars = "raw",
+          title = "Love Plot (IPTW)")  
+
+
+# Matching 
+love.plot(match_out, 
+          threshold = .1, # The "gold standard" balance limit
+          abs = TRUE, 
+          var.order = "unadjusted", 
+          line = TRUE, 
+          stars = "raw",
+          title = "Love Plot (Matching)")  
+```
+
+In the love-plot matching performs very poorly. In fact the adjusted covariates are worse off. 
+
+Overall the entropy balancing performed the best. All adjusted SMDs are virtually zero. The IPTW is next and then the matching performs poorly. 
+
+So let's look at our results. Since the entropy balancing model performed the best we will look at how the models look on that. 
+
+```{r}
+# The outcome model on weighted data (doubly robust)
+full_os_formula = formula(paste("Surv(OStime, OS) ~ Treatment +", paste(pred.vars.processed, collapse = " + ")))
+full_os_cox_ebal <- coxph(
+  full_os_formula, 
+  data = data, 
+  weights = entropy_ws_att$weights,
+)
+
+coef(full_os_cox_ebal)
+hr_os_ebal <- exp(coef(full_os_cox_ebal)["Treatment"])
+cat("The Hazard Ratio (Ebal) for the OS model is", hr_os_ebal, "\n")
+
+# DFS model
+full_dfs_formula = formula(paste("Surv(DFStime, DFS) ~ + Treatment +", paste(pred.vars.processed, collapse = " + ")))
+full_dfs_cox_ebal <- coxph(
+  full_dfs_formula, 
+  data=data,
+  weights = entropy_ws_att$weights)
+coef(full_dfs_cox_ebal)
+hr_dfs_ebal <- exp(coef(full_dfs_cox_ebal)["Treatment"])
+cat("The Hazard Ratio (Ebal) for the DFS model is", hr_dfs_ebal, "\n")
+
+# With confidence intervals
+exp(confint(full_os_cox_ebal)["Treatment", ])
+exp(confint(full_dfs_cox_ebal)["Treatment", ])
+```
+Notice that the hazard ratio is now 1.37 and 1.42 - much smaller. 
+
+# Example Simulation
+
+Let's try to simulate a dataset with what we have so far.
+The workflow is:
+
+(1) Use real OSCC data to estimate calibration parameters such as empirical distributions done using `ff.mean.sigma` and ``ff.dummy.` 
+
+(2) Simulate covariates from the empirical distribution functions through latent multivariate Normal structures, convert binary variables. This is done through `simulate_covariates_empirical`. 
+
+(3) Simulate treatment assignment of engraftment and PORT through a logistic regression on the covariates. This is done through `estimate_treatment_models`. 
+
+(4) Simulate outcome (DFS/OS) and their times. First, the  survival estimates from the baseline data are estimated through `estimate_baseline_models`. Using these baseline models, we can simulate the given outcomes (events) and the survival times thourgh `simulate_outcomes`. 
+
+(5) Assemble the full dataset
+
+The function ``ff.simulate.empirical` will encapsulate this all. This function takes in the empirical distribution of the data we want to simulate, as well as the treatment and outcome models to simulate the data. It can be tuned to a specific HR as well. 
+
+```{r}
+ff.simulate.empirical <- function(empirical_dist, n.sim, hr_treatment_dfs, hr_treatment_os, 
+                                 treatment_type, variables, cat_vars, cont_vars, 
+                                 baseline_models, treatment_models) {
+  
+  cat("Starting empirically-grounded simulation:\n")
+  cat("Sample size:", n.sim, "\n")
+  cat("Treatment type:", treatment_type, "\n")
+  cat("DFS HR:", hr_treatment_dfs, ", OS HR:", hr_treatment_os, "\n")
+  
+  if(n.sim <= 0) {
+    stop(paste("FF.SIMULATE.EMPIRICAL ERROR: Invalid sample size:", n.sim))
+  }
+  
+  if(!hr_treatment_dfs > 0 || !is.finite(hr_treatment_dfs)) {
+    stop(paste("FF.SIMULATE.EMPIRICAL ERROR: Invalid DFS hazard ratio:", hr_treatment_dfs))
+  }
+  
+  if(!hr_treatment_os > 0 || !is.finite(hr_treatment_os)) {
+    stop(paste("FF.SIMULATE.EMPIRICAL ERROR: Invalid OS hazard ratio:", hr_treatment_os))
+  }
+  
+  # Simulate covariates
+  sim_data <- simulate_covariates_empirical(empirical_dist, n.sim, variables, cat_vars, cont_vars)
+  cat("Empirical sample created with", nrow(sim_data), "subjects\n")
+  
+  # Assign treatment
+  sim_data$Treatment <- simulate_treatment_assignment(sim_data, treatment_type, treatment_models)
+  
+  # Generate outcomes
+  outcomes <- simulate_outcomes(sim_data, sim_data$Treatment, 
+                               hr_treatment_dfs, hr_treatment_os, baseline_models)
+  
+  sim_data$DFStime <- outcomes$DFStime
+  sim_data$DFS <- outcomes$DFS
+  sim_data$OStime <- outcomes$OStime
+  sim_data$OS <- outcomes$OS
+  
+  # Validate final dataset
+  if(any(is.na(sim_data$Treatment))) {
+    stop("FF.SIMULATE.EMPIRICAL ERROR: Missing treatment assignments")
+  }
+  
+  if(any(is.na(sim_data$DFStime)) || any(is.na(sim_data$DFS))) {
+    stop("FF.SIMULATE.EMPIRICAL ERROR: Missing DFS data")
+  }
+  
+  if(any(is.na(sim_data$OStime)) || any(is.na(sim_data$OS))) {
+    stop("FF.SIMULATE.EMPIRICAL ERROR: Missing OS data")
+  }
+  
+  # Summary statistics
+  cat("Data columns:", paste(colnames(sim_data), collapse = ", "), "\n")
+  cat("Treatment prevalence:", round(mean(sim_data$Treatment), 3), "\n")
+  cat("DFS: median time =", round(median(sim_data$DFStime), 1), 
+      ", event rate =", round(mean(sim_data$DFS), 3), "\n")
+  cat("OS: median time =", round(median(sim_data$OStime), 1), 
+      ", event rate =", round(mean(sim_data$OS), 3), "\n")
+  cat("Dataset generated with", nrow(sim_data), "observations\n\n")
+  
+  return(sim_data)
+}
+```
+
+Here we simulate a dataset of size 100. 
+```{r}
+empirical_dist <- ff.mean.sigma(ref.data.processed)
+baseline_models <- estimate_baseline_models(data)
+treatment_models <- estimate_treatment_models(data)
+
+simulated_data <- 
+  ff.simulate.empirical(empirical_dist, 100, 1.3, 1.5, "engraftment", pred.vars.processed, 
+                        cat.vars.processed, cont.vars.processed, baseline_models,
+                        treatment_models)
+simulated_data
+```
+
+# Missing Data Simulation
+
+There are three standard missing data mechanisms, defined by what the probability of missingness depends on:
+
+(1) MCAR — Missing Completely At Random
+Missingness is purely random, unrelated to anything in the data. The probability of being missing is the same for everyone regardless of their observed or unobserved values. This is the strongest and most unrealistic assumption — it essentially means the complete cases are a random subsample of the full data, so naive complete case analysis is still unbiased, just less efficient. The original simulation was only on MCAR. 
+
+(2) MAR — Missing At Random
+Missingness depends on observed data but not on the missing values themselves. Example: older patients are less likely to have LN positivity recorded, but conditional on age, missingness doesn't depend on the actual LN value. This is the most commonly assumed mechanism in practice and is what most modern methods (multiple imputation, IPW for missing data) target. "At random" is a misnomer as it just means the missingness is explainable by what you've observed.
+
+(3) MNAR — Missing Not At Random
+Missingness depends on the unobserved value itself. Example: patients with very high LN positivity are less likely to have it recorded precisely because it's so high. This is the most dangerous and hardest to handle — no standard method can correct for it without additional assumptions, because the information about why data is missing is contained in the missing data itself.
+
+The number matters as well - how many variables do we want missing? To begin let's just focus on the covariates first before moving on to treatment/outcome being missing. We can look at three options: single variable missing, two missing variables and all missing.
+
+Next we can look at how many observations will be missing in each variable. April's paper looked at 0%, 25% and 50%. I think it's clear that if we have half our data missing this is a major problem to begin with. Instead it might be easier to look at smaller numbers first - 0%, 10% and 25%. 
+
+## How to Simulate Missingness
+
+(1) MCAR is the easiest - it's purely random. In a given dataset we can just remove any number of observations purely at random. This is done with the `sample` function with replacement off. This randomly samples from the data without repeats - which will be the ones removed/replace with NA. 
+
+The following is the function to do this and an example of it.
+
+```{r}
+ff.miss.sub.mcar <- function(dataset, in.subj, in.pred) {
+  if(in.subj == 0) return(dataset)
+  
+  if(in.subj < 0 || in.subj > 1) {
+    stop(paste("FF.MISS.SUB.VAR ERROR: Invalid missingness proportion:", in.subj))
+  }
+  
+  if(length(in.pred) == 0) {
+    stop("FF.MISS.SUB.VAR ERROR: No predictor variables specified for missingness")
+  }
+  
+  missing_vars <- in.pred[!in.pred %in% colnames(dataset)]
+  if(length(missing_vars) > 0) {
+    stop(paste("FF.MISS.SUB.VAR ERROR: Variables not found in dataset:", paste(missing_vars, collapse = ", ")))
+  }
+  
+  n_total <- nrow(dataset)
+  n_missing <- round(n_total * in.subj)
+  
+  if(n_missing >= n_total) {
+    stop(paste("FF.MISS.SUB.VAR ERROR: Would make all subjects missing:", n_missing, ">=", n_total))
+  }
+  
+  # Randomly select subjects for missing data
+  missing_subjects <- sample(1:n_total, n_missing, replace = FALSE)
+  
+  # Apply missingness to specified predictors
+  for(var in in.pred) {
+    dataset[missing_subjects, var] <- NA
+  }
+  
+  cat("Applied", round(in.subj*100, 1), "% missingness to", length(in.pred), "variables\n")
+  return(dataset)
+}
+
+# Simualate 25% missing in Max_Tumor_Size
+data_mcar <- ff.miss.sub.mcar(simulated_data, 0.2, "Max_tumor_size")
+data_mcar
+```
+
+
+(2) MAR - the challenge is determining what clinically sensible choices for missing data would look like. There are a few steps we need to take.
+First - determine what makes sense for MAR data to be. 
+Second - make the functions that actually simulate MAR.
+Third - develop tools to assess whether MAR was actually achieved.
+
+```{r}
+ff.miss.mar <- function(dataset, in.subj, in.pred, drivers) {
+  # drivers: named list of which observed variables drive missingness
+  # e.g. drivers = list("ENE_bin" = c("Total_LN_positive_", "pN_7th_bin"))
+  
+  if(in.subj == 0) return(dataset)
+  
+  n_total <- nrow(dataset)
+  
+  for(var in in.pred) {
+    
+    # Get the variables that drive missingness for this variable
+    driver_vars <- drivers[[var]]
+    
+    if(is.null(driver_vars)) {
+      stop(paste("FF.MISS.MAR ERROR: No drivers specified for", var))
+    }
+    
+    missing_vars <- driver_vars[!driver_vars %in% colnames(dataset)]
+    if(length(missing_vars) > 0) {
+      stop(paste("FF.MISS.MAR ERROR: Driver variables not found:", 
+                 paste(missing_vars, collapse = ", ")))
+    }
+    
+    # Build linear combination of driver variables
+    lp <- rowSums(scale(dataset[, driver_vars, drop = FALSE]))
+    
+    # Calibrate intercept to achieve desired missingness proportion
+    # This make sure we get the exact proportion
+    # Use uniroot to find intercept that gives mean(prob) = in.subj
+    intercept <- uniroot(function(a) {
+      mean(plogis(a + lp)) - in.subj
+    }, interval = c(-20, 20))$root
+    
+    # Compute missingness probability for each subject
+    miss_prob <- plogis(intercept + lp)
+    
+    # Draw missingness indicator
+    missing_subjects <- rbinom(n_total, 1, miss_prob) == 1
+    
+    dataset[missing_subjects, var] <- NA
+    
+    cat("Applied MAR missingness to", var, 
+        "- actual proportion missing:", round(mean(missing_subjects), 3), "\n")
+  }
+  
+  return(dataset)
+}
+```
+
