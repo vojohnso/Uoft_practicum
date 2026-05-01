@@ -1,0 +1,212 @@
+---
+title: "Practicum_Final_Analysis"
+output: html_document
+date: "2026-04-19"
+---
+
+```{r setup, include=FALSE}
+library(survminer)
+library(cobalt)
+library(survival)
+library(SimDesign)
+library(writexl)
+library(readxl)
+library(tidyr)
+library(stringr)
+library(gt)
+setwd("~/Documents/School/Practicum")
+```
+ 
+############
+Poster Data
+ 
+```{r}
+results_poster_full <- read.csv("outputs/poster_data_long.csv")
+```
+ 
+Change the dataset to long format for easier formatting. 
+```{r}
+poster_long <- results_poster_full %>%
+  pivot_longer(
+    cols = matches("^(oracle|mcar|mar|mnar)\\.(mean\\.hr|median\\.hr|bias|rmse|coverage|power)\\.(dfs|os)$"),
+    names_to = c("missing_mechanism", "metric", "outcome"),
+    names_pattern = "^(oracle|mcar|mar|mnar)\\.(mean\\.hr|median\\.hr|bias|rmse|coverage|power)\\.(dfs|os)$",
+    values_to = "value"
+  ) %>%
+  mutate(
+    missing_mechanism = toupper(missing_mechanism),
+    outcome = toupper(outcome)
+  ) %>%
+  pivot_wider(
+    names_from = metric,
+    values_from = value
+  )
+
+poster_long <- poster_long %>%
+  mutate(
+    missing_mechanism = factor(missing_mechanism, levels = c("ORACLE", "MCAR", "MAR", "MNAR")),
+    outcome = factor(outcome, levels = c("DFS", "OS")),
+    causal_method = factor(causal_method, levels = c("match", "ebal", "iptw")),
+    input_ss = factor(input_ss),
+    input_mis_subj_lab = paste0(100 * input_mis_subj, "%"),
+    missing_method = case_when(
+      missing_method == "complete_case" ~ "Complete Case",
+      missing_method == "multiple_imputation" ~ "Multiple Imputation"
+    )
+  )
+```
+
+# Main table
+
+```{r}
+table_main <- poster_long %>%
+  dplyr::select(
+    outcome, missing_mechanism,
+    input_ss, input_hr_dfs, input_hr_os, input_mis_subj,
+    causal_method, missing_method,
+    mean.hr, median.hr, bias, rmse, coverage
+  ) %>%
+  arrange(outcome, missing_mechanism, input_mis_subj, causal_method, input_ss)
+
+# Returns the average of the simulation data based on outcome, missing mechanism, missing %, causal method and missing method
+# 
+table_avg <- poster_long %>%
+  group_by(outcome, missing_mechanism, input_mis_subj, causal_method, missing_method) %>%
+  summarise(
+    mean_hr = mean(mean.hr, na.rm = TRUE),
+    median_hr = mean(median.hr, na.rm = TRUE),
+    mean_bias = mean(bias, na.rm = TRUE),
+    mean_rmse = mean(rmse, na.rm = TRUE),
+    mean_coverage = mean(coverage, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(outcome, missing_mechanism, input_mis_subj, causal_method)
+```
+
+#Plots
+
+```{r}
+ggplot(
+  table_avg %>% filter(missing_mechanism != "ORACLE"),
+  aes(x = input_mis_subj, y = mean_bias, color = causal_method, group = causal_method)
+) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  labs(
+    x = "Missingness Proportion",
+    y = "Average Bias",
+    subtitle = "Dashed line = zero bias",
+    color = "Causal Method",
+    title = "Bias Across Missingness Mechanisms"
+  ) +
+  theme_sim()
+
+plot_base %>%
+  filter(outcome == "DFS") %>%
+  ggplot(aes(x = input_mis_subj, y = mean_bias,
+             color = causal_method, group = causal_method)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.5) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  scale_color_manual(values = method_colors, name = "Causal method") +
+  scale_x_continuous(breaks = c(0, 0.25, 0.50),
+                     labels = c("0%", "25%", "50%")) +
+  labs(title    = "Bias across missingness mechanisms",
+       subtitle = "Dashed line = zero bias",
+       x        = "Missingness proportion",
+       y        = "Mean bias (log HR)") +
+  theme_sim()
+
+```
+```{r}
+ggplot(
+  table_avg %>% filter(missing_mechanism != "ORACLE"),
+  aes(x = input_mis_subj, y = mean_rmse, color = causal_method, group = causal_method)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_grid(outcome ~ missing_mechanism) +
+  labs(
+    x = "Missingness proportion",
+    y = "Average RMSE",
+    color = "Causal method",
+    title = "RMSE across missingness mechanisms"
+  ) +
+  theme_bw()
+```
+
+```{r}
+ggplot(
+  table_avg %>% filter(missing_mechanism != "ORACLE", outcome == "DFS"),
+  aes(x = input_mis_subj, y = mean_coverage, color = causal_method, group = causal_method)
+) +
+  geom_hline(yintercept = 0.95, linetype = 2) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  labs(
+    x = "DFS Missingness proportion",
+    y = "Average coverage",
+    color = "Causal method",
+    title = "Coverage across missingness mechanisms"
+  ) +
+  theme_bw()
+
+ggplot(
+  table_avg %>% filter(missing_mechanism != "ORACLE", outcome == "OS"),
+  aes(x = input_mis_subj, y = mean_coverage, color = causal_method, group = causal_method)
+) +
+  geom_hline(yintercept = 0.95, linetype = 2) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  labs(
+    x = "OS Missingness proportion",
+    y = "Average coverage",
+    color = "Causal method",
+    title = "Coverage across missingness mechanisms"
+  ) +
+  theme_bw()
+```
+
+
+
+The most interesting findings are:
+1. Ebal is the most robust method — consistently near 0.95 across all mechanisms and missingness levels under complete case
+2. Complete case handles MCAR and MAR reasonably well — coverage stays near 0.95, suggesting complete case analysis is not dramatically worse than MI for these mechanisms
+3. MNAR degrades complete case performance — the expected finding, validates the simulation is working
+4. MI with matching is problematic — overcoverage suggests the combination of full matching weights and Rubin's rules inflates uncertainty
+5. The increasing coverage with missingness under MI is counterintuitive and worth investigating — it may be an artifact of the MI CIs being wider (more conservative) as missingness increases, which mechanically inflates coverage even if point estimates degrade
+
+```{r}
+tbl_data <- data.frame(
+  Factor = c(
+    "Sample size",
+    "True HR (DFS/OS)",
+    "Missingness proportion",
+    "Missingness mechanism",
+    "Causal method",
+    "Missing data strategy"
+  ),
+  Levels = c(
+    "500, 1000, 2000",
+    "1.0, 1.5, 2.0",
+    "0%, 25%, 50%",
+    "MCAR, MAR, MNAR",
+    "IPTW, ebal, matching",
+    "Complete case, MI"
+  )
+)
+
+gt(tbl_data) %>%
+  tab_header(
+    title = "Sample Size / Conditions Table"
+  )
+```
+
+
+ 
+ 
