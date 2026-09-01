@@ -1,10 +1,12 @@
 ---
-title: "Practicum_Final_Analysis"
+title: "Practicum Final Analysis"
 output: html_document
 date: "2026-04-19"
 ---
 
 ```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE)
+
 library(survminer)
 library(cobalt)
 library(survival)
@@ -16,219 +18,11 @@ library(stringr)
 library(gt)
 library(dplyr)
 library(patchwork)
+library(ggplot2)
+
 setwd("~/Documents/School/Practicum")
-```
- 
-############
-Poster Data
- 
-```{r}
-results_cc <- readRDS("outputs/final_cc.rds")
-results_mi_500 <- readRDS("outputs/final_mi_500.rds")
-results_mi_1000 <- readRDS("outputs/final_mi_1000.rds")
-```
- 
-```{r}
-cc_zero <- results_cc %>%
-  filter(input_mis_subj == 0) %>%
-  mutate(missing_method = "multiple_imputation")
 
-results_mi <- bind_rows(results_mi_500, results_mi_1000)
-
-results_full <- bind_rows(results_cc, results_mi)
-results_full <- bind_rows(
-  results_full,
-  results_full %>%
-    filter(missing_method == "complete_case", input_mis_subj == 0) %>%
-    mutate(missing_method = "multiple_imputation")
-) %>%
-  distinct()
-```
-
-
-Change the dataset to long format for easier formatting. 
-```{r}
-poster_long <- results_full %>%
-  pivot_longer(
-    cols = matches("^(oracle|mcar|mar|mnar)\\.(mean\\.hr|median\\.hr|bias|rmse|coverage|power)\\.(dfs|os)$"),
-    names_to = c("missing_mechanism", "metric", "outcome"),
-    names_pattern = "^(oracle|mcar|mar|mnar)\\.(mean\\.hr|median\\.hr|bias|rmse|coverage|power)\\.(dfs|os)$",
-    values_to = "value"
-  ) %>%
-  mutate(
-    missing_mechanism = toupper(missing_mechanism),
-    outcome           = toupper(outcome)
-  ) %>%
-  pivot_wider(names_from = metric, values_from = value) %>%
-  mutate(
-    missing_mechanism = factor(missing_mechanism,
-                               levels = c("ORACLE", "MCAR", "MAR", "MNAR")),
-    outcome       = factor(outcome, levels = c("DFS", "OS")),
-    causal_method = factor(causal_method, levels = c("match", "ebal", "iptw")),
-    input_ss      = factor(input_ss),
-    missing_method = case_when(
-      missing_method == "complete_case"       ~ "Complete Case",
-      missing_method == "multiple_imputation" ~ "Multiple Imputation",
-      TRUE ~ missing_method
-    ),
-    input_mis_subj_lab = paste0(100 * input_mis_subj, "%")
-  )
-```
-
-# Data Generating Data
-
-```{r}
-original_data <- read.csv("predata_s2.csv")
-
-original_data_clean <- prep_data(original_data)
-pred_vars <- c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin", 
-               "ENE_bin", "PORT_bin", 
-               "Max_tumor_size", "Total_LN_positive_")
-
-# 1. Covariate means and covariance matrix
-emp_means <- colMeans(original_data_clean[, pred_vars], na.rm=TRUE)
-emp_cov   <- cov(original_data_clean[, pred_vars], use="complete.obs")
-
-round(emp_means, 3)
-round(emp_cov, 3)
-
-# 2. Binary variable thresholds (quantiles used for dichotomisation)
-binary_vars <- c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin", 
-                 "ENE_bin", "PORT_bin")
-binary_props <- sapply(binary_vars, function(v) 
-  round(mean(original_data_clean[[v]], na.rm=TRUE), 3))
-print(binary_props)
-
-# 3. Treatment model coefficients
-ps_formula <- as.formula(paste("Treatment ~", 
-                                paste(pred_vars, collapse=" + ")))
-ps_model <- glm(ps_formula, 
-                data=original_data_clean, 
-                family=binomial)
-round(coef(ps_model), 3)
-
-# 4. Weibull outcome model parameters — DFS
-library(survival)
-weibull_dfs <- survreg(
-  Surv(DFStime, DFS) ~ Age_Dx_bin + pT_7th_bin + pN_7th_bin +
-                       ENE_bin + PORT_bin + 
-                       Max_tumor_size + Total_LN_positive_,
-  data = original_data_clean,
-  dist = "weibull"
-)
-round(coef(weibull_dfs), 3)
-round(weibull_dfs$scale, 3)
-
-# 5. Weibull outcome model parameters — OS
-weibull_os <- survreg(
-  Surv(OStime, OS) ~ Age_Dx_bin + pT_7th_bin + pN_7th_bin +
-                     ENE_bin + PORT_bin + 
-                     Max_tumor_size + Total_LN_positive_,
-  data = original_data_clean,
-  dist = "weibull"
-)
-round(coef(weibull_os), 3)
-round(weibull_os$scale, 3)
-
-# 6. Censoring rate
-cat("DFS censoring rate:", 
-    round(1 - mean(original_data_clean$DFS), 3), "\n")
-cat("OS censoring rate:",  
-    round(1 - mean(original_data_clean$OS),  3), "\n")
-```
-
-# Assumption Checking
-
-```{r}
-library(survival)
-library(survminer)
-
-# Fit Weibull to real data
-weibull_dfs <- survreg(
-  Surv(DFStime, DFS) ~ Age_Dx_bin + pT_7th_bin + pN_7th_bin +
-                       ENE_bin + PORT_bin +
-                       Max_tumor_size + Total_LN_positive_,
-  data = original_data_clean,
-  dist = "weibull"
-)
-
-# Log cumulative hazard plot to verify linearity
-# Stratify by strongest confounders
-fit_km <- survfit(Surv(DFStime, DFS) ~ ENE_bin,
-                  data = original_data_clean)
-
-# Plot log(-log(S(t))) vs log(t)
-# Under Weibull this should be linear
-ggsurvplot(fit_km,
-           fun      = "cloglog",
-           palette  = c("#E74C3C", "#3498DB"),
-           xlab     = "log(time)",
-           ylab     = "log(-log(S(t)))",
-           title    = "Log cumulative hazard plot — DFS by ENE status",
-           legend.labs = c("ENE absent", "ENE present")) +
-  theme_sim()
-```
-
-# Proportion Analysis of Our Data Generation
-
-```{r}
-# Run Generate on a representative condition many times
-# and check the binary variable prevalences
-
-test_cond <- Design_final[1, ]
-prevalence_check <- replicate(500, {
-  dat <- Generate(test_cond, fixed_objects)
-  sapply(c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin", 
-           "ENE_bin", "PORT_bin"),
-         function(v) mean(dat$dataset.complete[[v]]))
-})
-
-# Compare simulated to empirical
-empirical <- c(0.500, 0.389, 0.410, 0.257, 0.594)
-simulated  <- rowMeans(prevalence_check)
-
-data.frame(
-  variable   = c("Age at Dx", "pT Stage", "pN Stage", "ENE", "PORT"),
-  empirical  = round(empirical, 3),
-  simulated  = round(simulated, 3),
-  difference = round(simulated - empirical, 3)
-)
-```
-```{r}
-# Verify the proportion of negative draws across replicates
-negative_check <- replicate(500, {
-  dat <- Generate(test_cond, fixed_objects)
-  # Check how many were truncated by looking at zeros
-  # since Generate replaces negatives with zero
-  c(
-    tumor_zeros = mean(dat$dataset.complete$Max_tumor_size == 0),
-    ln_zeros = mean(dat$dataset.complete$Total_LN_positive_ == 0)
-  )
-})
-
-rowMeans(negative_check)
-```
-
-
-# Main table
-
-```{r}
-table_avg <- poster_long %>%
-  group_by(outcome, missing_mechanism, input_mis_subj,
-           causal_method, missing_method) %>%
-  summarise(
-    mean_hr = mean(mean.hr,   na.rm = TRUE),
-    median_hr = mean(median.hr, na.rm = TRUE),
-    mean_bias = mean(bias,      na.rm = TRUE),
-    mean_rmse = mean(rmse,      na.rm = TRUE),
-    mean_coverage = mean(coverage, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  arrange(outcome, missing_mechanism, input_mis_subj, causal_method)
-write.csv(table_avg, "outputs/table_avg.csv")
-```
-
-```{r}
+# Shared theme -- defined first so all chunks can use it
 theme_sim <- function() {
   theme_minimal(base_size = 11) +
     theme(
@@ -236,7 +30,7 @@ theme_sim <- function() {
       strip.text = element_text(face = "bold", size = 10),
       panel.grid.minor = element_blank(),
       panel.border = element_rect(color = "#cccccc", fill = NA),
-      legend.position  = "bottom",
+      legend.position = "bottom",
       legend.title = element_text(face = "bold"),
       plot.title = element_text(face = "bold", size = 13),
       plot.subtitle = element_text(size = 10, color = "#555555")
@@ -247,327 +41,299 @@ method_colors <- c("match" = "#E74C3C", "ebal" = "#2ECC71", "iptw" = "#3498DB")
 mech_levels <- c("MCAR", "MAR", "MNAR")
 ```
 
-```{r}
-plot_base <- table_avg %>%
-  filter(missing_mechanism %in% mech_levels)
+# Poster Data
 
-# ── Plot 1: Coverage ──────────────────────────────────────────────────────────
-p_coverage <- plot_base %>%
-  filter(outcome == "DFS") %>%
-  ggplot(aes(x = input_mis_subj, y = mean_coverage,
-             color = causal_method, group = causal_method)) +
-  geom_hline(yintercept = 0.95, linetype = "dashed",
-             color = "black", linewidth = 0.5) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
-  facet_grid(missing_method ~ missing_mechanism) +
-  scale_color_manual(values = method_colors, name = "Causal method") +
-  scale_x_continuous(breaks = c(0, 0.25, 0.50),
-                     labels = c("0%", "25%", "50%")) +
-  scale_y_continuous(limits = c(0.85, 1.00),
-                     breaks = seq(0.85, 1.00, by = 0.02)) +
-  labs(title    = "Coverage across missingness mechanisms — DFS",
-       subtitle = "Dashed line = nominal 0.95 target",
-       x = "Missingness proportion",
-       y = "Average coverage") +
-  theme_sim()
+```{r load-data}
+results_cc <- readRDS("outputs/final_cc.rds")
+results_mi_500 <- readRDS("outputs/final_mi_500.rds")
+results_mi_1000 <- readRDS("outputs/final_mi_1000.rds")
+```
 
-# ── Plot 2: Bias ──────────────────────────────────────────────────────────────
-p_bias <- plot_base %>%
-  filter(outcome == "DFS") %>%
-  ggplot(aes(x = input_mis_subj, y = mean_bias,
-             color = causal_method, group = causal_method)) +
-  geom_hline(yintercept = 0, linetype = "dashed",
-             color = "black", linewidth = 0.5) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
-  facet_grid(missing_method ~ missing_mechanism) +
-  scale_color_manual(values = method_colors, name = "Causal method") +
-  scale_x_continuous(breaks = c(0, 0.25, 0.50),
-                     labels = c("0%", "25%", "50%")) +
-  labs(title    = "Bias across missingness mechanisms — DFS",
-       subtitle = "Dashed line = zero bias",
-       x = "Missingness proportion",
-       y = "Mean bias (log HR)") +
-  theme_sim()
+```{r combine-results}
+results_mi <- bind_rows(results_mi_500, results_mi_1000)
 
-# ── Plot 3: RMSE ──────────────────────────────────────────────────────────────
-p_rmse <- plot_base %>%
-  filter(outcome == "DFS") %>%
-  ggplot(aes(x = input_mis_subj, y = mean_rmse,
-             color = causal_method, group = causal_method)) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
-  facet_grid(missing_method ~ missing_mechanism) +
-  scale_color_manual(values = method_colors, name = "Causal method") +
-  scale_x_continuous(breaks = c(0, 0.25, 0.50),
-                     labels = c("0%", "25%", "50%")) +
-  labs(title = "RMSE across missingness mechanisms — DFS",
-       x = "Missingness proportion",
-       y = "RMSE") +
-  theme_sim()
+results_full <- bind_rows(results_cc, results_mi)
+results_full <- bind_rows(
+  results_full,
+  results_full %>%
+    dplyr::filter(missing_method == "complete_case", input_mis_subj == 0) %>%
+    dplyr::mutate(missing_method = "multiple_imputation")
+) %>%
+  distinct()
+```
 
-# ── Plot 4: Coverage heatmap ──────────────────────────────────────────────────
-p_heat_coverage <- plot_base %>%
-  filter(outcome == "DFS") %>%
-  mutate(
-    mis_lab = paste0(input_mis_subj * 100, "%"),
-    coverage_cat = case_when(
-      mean_coverage < 0.90  ~ "< 0.90",
-      mean_coverage < 0.93  ~ "0.90-0.93",
-      mean_coverage < 0.95  ~ "0.93-0.95",
-      mean_coverage <= 0.97 ~ "0.95-0.97",
-      TRUE                  ~ "> 0.97"
-    ),
-    coverage_cat = factor(coverage_cat,
-                          levels = c("< 0.90", "0.90-0.93", "0.93-0.95",
-                                     "0.95-0.97", "> 0.97"))
+```{r pivot-long}
+poster_long <- results_full %>%
+  pivot_longer(
+    cols = matches("^(oracle|mcar|mar|mnar)\\.(mean\\.hr|median\\.hr|bias|rmse|coverage|power)\\.(dfs|os)$"),
+    names_to = c("missing_mechanism", "metric", "outcome"),
+    names_pattern = "^(oracle|mcar|mar|mnar)\\.(mean\\.hr|median\\.hr|bias|rmse|coverage|power)\\.(dfs|os)$",
+    values_to = "value"
   ) %>%
-  ggplot(aes(x = mis_lab, y = causal_method, fill = coverage_cat)) +
-  geom_tile(color = "white", linewidth = 0.5) +
-  geom_text(aes(label = round(mean_coverage, 3)), size = 3) +
-  facet_grid(missing_method ~ missing_mechanism) +
-  scale_fill_manual(
-    values = c("< 0.90"    = "#d73027",
-               "0.90-0.93" = "#fc8d59",
-               "0.93-0.95" = "#fee090",
-               "0.95-0.97" = "#91cf60",
-               "> 0.97"    = "#1a9850"),
-    name = "Coverage"
-  ) +
-  labs(title = "Coverage heatmap — DFS",
-       x = "Missingness proportion",
-       y = "Causal method") +
-  theme_sim()
+  dplyr::mutate(
+    missing_mechanism = toupper(missing_mechanism),
+    outcome = toupper(outcome)
+  ) %>%
+  pivot_wider(names_from = metric, values_from = value) %>%
+  dplyr::mutate(
+    missing_mechanism = factor(missing_mechanism,
+                                levels = c("ORACLE", "MCAR", "MAR", "MNAR")),
+    outcome = factor(outcome, levels = c("DFS", "OS")),
+    causal_method = factor(causal_method, levels = c("match", "ebal", "iptw")),
+    input_ss = factor(input_ss),
+    missing_method = case_when(
+      missing_method == "complete_case"       ~ "Complete Case",
+      missing_method == "multiple_imputation" ~ "Multiple Imputation",
+      TRUE ~ missing_method
+    ),
+    input_mis_subj_lab = paste0(100 * input_mis_subj, "%")
+  )
+```
 
-# ── Plot 5: Bias heatmap ──────────────────────────────────────────────────────
-p_heat_bias <- plot_base %>%
-  filter(outcome == "DFS") %>%
-  mutate(mis_lab = paste0(input_mis_subj * 100, "%")) %>%
-  ggplot(aes(x = mis_lab, y = causal_method, fill = mean_bias)) +
-  geom_tile(color = "white", linewidth = 0.5) +
-  geom_text(aes(label = round(mean_bias, 3)), size = 3) +
-  facet_grid(missing_method ~ missing_mechanism) +
-  scale_fill_gradient2(low = "#3498DB", mid = "white", high = "#E74C3C",
-                       midpoint = 0, name = "Bias\n(log HR)") +
-  labs(title = "Bias heatmap — DFS",
-       x = "Missingness proportion",
-       y = "Causal method") +
-  theme_sim()
+# Data Generating Mechanism Parameters
 
-# ── Plot 6: Coverage boxplot ──────────────────────────────────────────────────
-p_coverage_box <- plot_base %>%
-  filter(outcome == "DFS") %>%
-  ggplot(aes(x = causal_method, y = mean_coverage, fill = causal_method)) +
-  geom_boxplot(alpha = 0.7, outlier.shape = 21, outlier.size = 1.5) +
-  geom_hline(yintercept = 0.95, linetype = "dashed",
-             linewidth = 0.5, color = "red") +
-  facet_grid(missing_method ~ missing_mechanism) +
-  scale_fill_manual(values = method_colors) +
-  labs(title = "Distribution of coverage probabilities — DFS",
-       x = "Causal method",
-       y = "Coverage probability") +
-  theme_sim() +
-  theme(legend.position = "none")
+```{r dgm-params}
+original_data_clean <- readRDS("outputs/original_data_clean.rds")
 
-p_coverage_box_os <- plot_base %>%
-  filter(outcome == "OS") %>%
-  ggplot(aes(x = causal_method, y = mean_coverage, fill = causal_method)) +
-  geom_boxplot(alpha = 0.7, outlier.shape = 21, outlier.size = 1.5) +
-  geom_hline(yintercept = 0.95, linetype = "dashed",
-             linewidth = 0.5, color = "red") +
-  facet_grid(missing_method ~ missing_mechanism) +
-  scale_fill_manual(values = method_colors) +
-  labs(title = "Distribution of coverage probabilities — OS",
-       x = "Causal method",
-       y = "Coverage probability") +
-  theme_sim() +
-  theme(legend.position = "none")
+pred_vars <- c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin",
+               "ENE_bin", "PORT_bin",
+               "Max_tumor_size", "Total_LN_positive_")
 
-# ── Plot 7: Combined coverage + bias (poster style) ───────────────────────────
-p_combined_dfs <- (p_coverage + p_bias) +
-  plot_layout(guides = "collect") &
-  theme(legend.position = "bottom")
+# Covariate means
+emp_means <- colMeans(original_data_clean[, pred_vars], na.rm=TRUE)
+round(emp_means, 3)
 
-# OS versions
-p_coverage_os <- plot_base %>%
-  filter(outcome == "OS") %>%
-  ggplot(aes(x = input_mis_subj, y = mean_coverage,
-             color = causal_method, group = causal_method)) +
-  geom_hline(yintercept = 0.95, linetype = "dashed", linewidth = 0.5) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
-  facet_grid(missing_method ~ missing_mechanism) +
-  scale_color_manual(values = method_colors, name = "Causal method") +
-  scale_x_continuous(breaks = c(0, 0.25, 0.50),
-                     labels = c("0%", "25%", "50%")) +
-  labs(title = "Coverage across missingness mechanisms — OS",
-       subtitle = "Dashed line = nominal 0.95 target",
-       x = "Missingness proportion",
-       y = "Average coverage") +
-  theme_sim()
+# Covariance matrix
+emp_cov <- cov(original_data_clean[, pred_vars], use="complete.obs")
+round(emp_cov, 3)
 
-p_bias_os <- plot_base %>%
-  filter(outcome == "OS") %>%
-  ggplot(aes(x = input_mis_subj, y = mean_bias,
-             color = causal_method, group = causal_method)) +
-  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.5) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
-  facet_grid(missing_method ~ missing_mechanism) +
-  scale_color_manual(values = method_colors, name = "Causal method") +
-  scale_x_continuous(breaks = c(0, 0.25, 0.50),
-                     labels = c("0%", "25%", "50%")) +
-  labs(title = "Bias across missingness mechanisms — OS",
-       subtitle = "Dashed line = zero bias",
-       x = "Missingness proportion",
-       y = "Mean bias (log HR)") +
-  theme_sim()
+# Binary variable prevalences
+binary_vars <- c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin", "ENE_bin", "PORT_bin")
+binary_props <- sapply(binary_vars, function(v)
+  round(mean(original_data_clean[[v]], na.rm=TRUE), 3))
+print(binary_props)
 
-p_combined_os <- patchwork::wrap_plots(p_coverage_os + p_bias_os) +
-  plot_layout(guides = "collect") &
-  theme(legend.position = "bottom")
+# Treatment model coefficients
+ps_formula <- as.formula(paste("Treatment ~",
+                                paste(pred_vars, collapse=" + ")))
+ps_model <- glm(ps_formula, data=original_data_clean, family=binomial)
+round(coef(ps_model), 3)
 
-# Plot 8: Confounding Plot
+# Weibull DFS
+weibull_dfs <- survreg(
+  Surv(DFStime, DFS) ~ Age_Dx_bin + pT_7th_bin + pN_7th_bin +
+                       ENE_bin + PORT_bin +
+                       Max_tumor_size + Total_LN_positive_,
+  data = original_data_clean,
+  dist = "weibull"
+)
+round(coef(weibull_dfs), 3)
+cat("DFS scale:", round(weibull_dfs$scale, 3), "\n")
 
+# Weibull OS
+weibull_os <- survreg(
+  Surv(OStime, OS) ~ Age_Dx_bin + pT_7th_bin + pN_7th_bin +
+                     ENE_bin + PORT_bin +
+                     Max_tumor_size + Total_LN_positive_,
+  data = original_data_clean,
+  dist = "weibull"
+)
+round(coef(weibull_os), 3)
+cat("OS scale:", round(weibull_os$scale, 3), "\n")
+
+# Censoring rates
+cat("DFS censoring rate:", round(1 - mean(original_data_clean$DFS), 3), "\n")
+cat("OS censoring rate: ", round(1 - mean(original_data_clean$OS),  3), "\n")
+
+# Zero rates for continuous variables
+cat("LN Positive zero rate (empirical):",
+    round(mean(original_data_clean$Total_LN_positive_ == 0), 3), "\n")
+cat("Tumour Size zero rate (empirical):",
+    round(mean(original_data_clean$Max_tumor_size == 0), 3), "\n")
+```
+
+# Assumption Checking
+
+```{r weibull-check}
+fit_km <- survfit(Surv(DFStime, DFS) ~ ENE_bin,
+                  data = original_data_clean)
+
+ggsurvplot(fit_km,
+           fun = "cloglog",
+           palette = c("#E74C3C", "#3498DB"),
+           xlab = "log(time)",
+           ylab = "log(-log(S(t)))",
+           title = "Log cumulative hazard plot - DFS by ENE status",
+           legend.labs = c("ENE absent", "ENE present"))
+```
+
+# Proportion Analysis of Data Generation
+
+```{r prevalence-check, eval=FALSE}
+# NOTE: eval=FALSE -- run manually in console, takes several minutes
+# Requires Design_final and fixed_objects to be loaded from Full_Script.Rmd
+
+test_cond <- Design_final[
+  Design_final$input_ss == 500 &
+  Design_final$input_mis_subj == 0 &
+  Design_final$causal_method == "iptw" &
+  Design_final$missing_method == "complete_case" &
+  Design_final$confounding_scale == 1.0, ][1, ]
+
+prevalence_check <- replicate(500, {
+  dat <- Generate(test_cond, fixed_objects)
+  sapply(c("Age_Dx_bin", "pT_7th_bin", "pN_7th_bin",
+           "ENE_bin", "PORT_bin"),
+         function(v) mean(dat$dataset.complete[[v]]))
+})
+
+empirical <- c(0.500, 0.389, 0.410, 0.257, 0.594)
+simulated <- rowMeans(prevalence_check)
+
+data.frame(
+  variable = c("Age at Dx", "pT Stage", "pN Stage", "ENE", "PORT"),
+  empirical = round(empirical, 3),
+  simulated = round(simulated, 3),
+  difference = round(simulated - empirical, 3)
+)
+```
+
+```{r negative-check, eval=FALSE}
+# NOTE: eval=FALSE -- run manually in console, takes several minutes
+# Requires test_cond defined above
+
+negative_check <- replicate(500, {
+  dat <- Generate(test_cond, fixed_objects)
+  c(
+    tumor_zeros = mean(dat$dataset.complete$Max_tumor_size == 0),
+    ln_zeros = mean(dat$dataset.complete$Total_LN_positive_ == 0)
+  )
+})
+
+rowMeans(negative_check)
+```
+
+# Summary Tables
+
+```{r table-avg}
+table_avg <- poster_long %>%
+  dplyr::group_by(outcome, missing_mechanism, input_mis_subj,
+                  causal_method, missing_method) %>%
+  dplyr::summarise(
+    mean_hr = mean(mean.hr,   na.rm=TRUE),
+    median_hr = mean(median.hr, na.rm=TRUE),
+    mean_bias = mean(bias,      na.rm=TRUE),
+    mean_rmse = mean(rmse,      na.rm=TRUE),
+    mean_coverage = mean(coverage,  na.rm=TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(outcome, missing_mechanism, input_mis_subj, causal_method)
+
+write.csv(table_avg, "outputs/table_avg.csv", row.names=FALSE)
+```
+
+```{r table-confounding}
 table_avg_confounding <- poster_long %>%
   dplyr::group_by(outcome, missing_mechanism, input_mis_subj,
                   missing_method, confounding_scale) %>%
   dplyr::summarise(
-    mean_bias     = mean(bias,      na.rm = TRUE),
-    mean_rmse     = mean(rmse,      na.rm = TRUE),
-    mean_coverage = mean(coverage,  na.rm = TRUE),
+    mean_bias = mean(bias, na.rm=TRUE),
+    mean_rmse = mean(rmse, na.rm=TRUE),
+    mean_coverage = mean(coverage, na.rm=TRUE),
     .groups = "drop"
   )
+```
 
-plot_base_confounding <- table_avg_confounding %>%
-  filter(missing_mechanism %in% mech_levels)
-
-p_confounding <- plot_base_confounding %>%
-  dplyr::filter(outcome == "DFS") %>%
-  ggplot(aes(x = input_mis_subj, y = mean_bias,
-             color = factor(confounding_scale),
-             group = factor(confounding_scale))) +
-  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.5) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
-  facet_grid(missing_method ~ missing_mechanism) +
-  scale_color_manual(
-    values = c("0.5" = "#3498DB", "1" = "#E74C3C", "2" = "#2ECC71"),
-    name = "Confounding scale"
-  ) +
-  scale_x_continuous(breaks = c(0, 0.25, 0.50),
-                     labels = c("0%", "25%", "50%")) +
-  labs(title = "Bias across missingness mechanisms by confounding scale",
-       x = "Missingness proportion",
-       y = "Mean bias (log HR)") +
-  theme_sim()
-
+```{r table-ss}
 table_avg_ss <- poster_long %>%
-  group_by(outcome, missing_mechanism, input_mis_subj,
-           input_ss, missing_method) %>%
-  summarise(
-    mean_hr      = mean(mean.hr,   na.rm = TRUE),
-    median_hr    = mean(median.hr, na.rm = TRUE),
-    mean_bias    = mean(bias,      na.rm = TRUE),
-    mean_rmse    = mean(rmse,      na.rm = TRUE),
-    mean_coverage = mean(coverage, na.rm = TRUE),
+  dplyr::group_by(outcome, missing_mechanism, input_mis_subj,
+                  input_ss, missing_method) %>%
+  dplyr::summarise(
+    mean_hr = mean(mean.hr,   na.rm=TRUE),
+    median_hr = mean(median.hr, na.rm=TRUE),
+    mean_bias = mean(bias,      na.rm=TRUE),
+    mean_rmse = mean(rmse,      na.rm=TRUE),
+    mean_coverage = mean(coverage,  na.rm=TRUE),
     .groups = "drop"
   ) %>%
-  arrange(outcome, missing_mechanism, input_mis_subj, input_ss)
+  dplyr::arrange(outcome, missing_mechanism, input_mis_subj, input_ss)
+```
+
+# DFS Plots
+
+```{r plot-bases}
+plot_base <- table_avg %>%
+  dplyr::filter(missing_mechanism %in% mech_levels)
+
+plot_base_confounding <- table_avg_confounding %>%
+  dplyr::filter(missing_mechanism %in% mech_levels)
 
 plot_base_ss <- table_avg_ss %>%
-  filter(missing_mechanism %in% mech_levels)
-# Plot 9: Sample size plot   
-p_sample_size <- plot_base_ss %>%
+  dplyr::filter(missing_mechanism %in% mech_levels)
+```
+
+```{r p-coverage-dfs}
+p_coverage <- plot_base %>%
   dplyr::filter(outcome == "DFS") %>%
-  ggplot(aes(x = input_mis_subj, y = mean_coverage,
-             color = factor(input_ss),
-             group = factor(input_ss))) +
-  geom_hline(yintercept = 0.95, linetype = "dashed", linewidth = 0.5) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
+  ggplot(aes(x=input_mis_subj, y=mean_coverage,
+             color=causal_method, group=causal_method)) +
+  geom_hline(yintercept=0.95, linetype="dashed",
+             color="black", linewidth=0.5) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2) +
   facet_grid(missing_method ~ missing_mechanism) +
-  scale_color_manual(
-    values = c("500" = "#E74C3C", "1000" = "#3498DB"),
-    name = "Sample size"
-  ) +
-  scale_x_continuous(breaks = c(0, 0.25, 0.50),
-                     labels = c("0%", "25%", "50%")) +
-  labs(title = "Coverage across missingness mechanisms by sample size",
+  scale_color_manual(values=method_colors, name="Causal method") +
+  scale_x_continuous(breaks=c(0, 0.25, 0.50),
+                     labels=c("0%", "25%", "50%")) +
+  scale_y_continuous(limits=c(0.85, 1.00),
+                     breaks=seq(0.85, 1.00, by=0.02)) +
+  labs(title = "Coverage across missingness mechanisms - DFS",
+       subtitle = "Dashed line = nominal 0.95 target",
        x = "Missingness proportion",
        y = "Average coverage") +
   theme_sim()
-
-# ── Print all ─────────────────────────────────────────────────────────────────
-print(p_coverage)
-print(p_coverage_os)
-print(p_bias)
-print(p_rmse)
-print(p_heat_coverage)
-print(p_heat_bias)
-print(p_coverage_box)
-print(p_coverage_box_os)
-print(p_combined_dfs)
-print(p_combined_os)
-print(p_confounding)
-print(p_sample_size)
-
-# ── Save ──────────────────────────────────────────────────────────────────────
-ggsave("practicum_paper/outputs/p_coverage_dfs.png",    p_coverage,        width=10, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_coverage_os.png",     p_coverage_os,     width=10, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_bias_dfs.png",        p_bias,            width=10, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_rmse_dfs.png",        p_rmse,            width=10, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_heat_coverage.png",   p_heat_coverage,   width=10, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_heat_bias.png",       p_heat_bias,       width=10, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_coverage_box.png",    p_coverage_box,    width=10, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_coverage_box_os.png", p_coverage_box_os, width=10, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_combined_dfs.png",    p_combined_dfs,    width=14, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_combined_os.png",     p_combined_os,     width=14, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_confounding.png",     p_confounding,     width=14, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_sample_size.png",     p_sample_size,     width=14, height=6, dpi=300)
-
 ```
 
-```{r}
-# ── OS: Bias ──────────────────────────────────────────────────────────────────
-p_bias_os <- plot_base %>%
-  dplyr::filter(outcome == "OS") %>%
-  ggplot(aes(x = input_mis_subj, y = mean_bias,
-             color = causal_method, group = causal_method)) +
-  geom_hline(yintercept = 0, linetype = "dashed",
-             color = "black", linewidth = 0.5) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
+```{r p-bias-dfs}
+p_bias <- plot_base %>%
+  dplyr::filter(outcome == "DFS") %>%
+  ggplot(aes(x=input_mis_subj, y=mean_bias,
+             color=causal_method, group=causal_method)) +
+  geom_hline(yintercept=0, linetype="dashed",
+             color="black", linewidth=0.5) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2) +
   facet_grid(missing_method ~ missing_mechanism) +
-  scale_color_manual(values = method_colors, name = "Causal method") +
-  scale_x_continuous(breaks = c(0, 0.25, 0.50),
-                     labels = c("0%", "25%", "50%")) +
-  labs(title    = "Bias across missingness mechanisms — OS",
+  scale_color_manual(values=method_colors, name="Causal method") +
+  scale_x_continuous(breaks=c(0, 0.25, 0.50),
+                     labels=c("0%", "25%", "50%")) +
+  labs(title = "Bias across missingness mechanisms - DFS",
        subtitle = "Dashed line = zero bias",
        x = "Missingness proportion",
        y = "Mean bias (log HR)") +
   theme_sim()
+```
 
-# ── OS: RMSE ──────────────────────────────────────────────────────────────────
-p_rmse_os <- plot_base %>%
-  dplyr::filter(outcome == "OS") %>%
-  ggplot(aes(x = input_mis_subj, y = mean_rmse,
-             color = causal_method, group = causal_method)) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
+```{r p-rmse-dfs}
+p_rmse <- plot_base %>%
+  dplyr::filter(outcome == "DFS") %>%
+  ggplot(aes(x=input_mis_subj, y=mean_rmse,
+             color=causal_method, group=causal_method)) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2) +
   facet_grid(missing_method ~ missing_mechanism) +
-  scale_color_manual(values = method_colors, name = "Causal method") +
-  scale_x_continuous(breaks = c(0, 0.25, 0.50),
-                     labels = c("0%", "25%", "50%")) +
-  labs(title = "RMSE across missingness mechanisms — OS",
+  scale_color_manual(values=method_colors, name="Causal method") +
+  scale_x_continuous(breaks=c(0, 0.25, 0.50),
+                     labels=c("0%", "25%", "50%")) +
+  labs(title = "RMSE across missingness mechanisms - DFS",
        x = "Missingness proportion",
        y = "RMSE") +
   theme_sim()
+```
 
-# ── OS: Coverage heatmap ──────────────────────────────────────────────────────
-p_heat_coverage_os <- plot_base %>%
-  dplyr::filter(outcome == "OS") %>%
+```{r p-heat-coverage}
+p_heat_coverage <- plot_base %>%
+  dplyr::filter(outcome == "DFS") %>%
   dplyr::mutate(
     mis_lab = paste0(input_mis_subj * 100, "%"),
     coverage_cat = case_when(
@@ -581,100 +347,339 @@ p_heat_coverage_os <- plot_base %>%
                           levels = c("< 0.90", "0.90-0.93", "0.93-0.95",
                                      "0.95-0.97", "> 0.97"))
   ) %>%
-  ggplot(aes(x = mis_lab, y = causal_method, fill = coverage_cat)) +
-  geom_tile(color = "white", linewidth = 0.5) +
-  geom_text(aes(label = round(mean_coverage, 3)), size = 3) +
+  ggplot(aes(x=mis_lab, y=causal_method, fill=coverage_cat)) +
+  geom_tile(color="white", linewidth=0.5) +
+  geom_text(aes(label=round(mean_coverage, 3)), size=3) +
   facet_grid(missing_method ~ missing_mechanism) +
   scale_fill_manual(
-    values = c("< 0.90"    = "#d73027",
+    values = c("< 0.90" = "#d73027",
                "0.90-0.93" = "#fc8d59",
                "0.93-0.95" = "#fee090",
                "0.95-0.97" = "#91cf60",
-               "> 0.97"    = "#1a9850"),
+               "> 0.97" = "#1a9850"),
     name = "Coverage"
   ) +
-  labs(title = "Coverage heatmap — OS",
+  labs(title = "Coverage heatmap - DFS",
        x = "Missingness proportion",
        y = "Causal method") +
   theme_sim()
+```
 
-# ── OS: Bias heatmap ──────────────────────────────────────────────────────────
-p_heat_bias_os <- plot_base %>%
-  dplyr::filter(outcome == "OS") %>%
+```{r p-heat-bias}
+p_heat_bias <- plot_base %>%
+  dplyr::filter(outcome == "DFS") %>%
   dplyr::mutate(mis_lab = paste0(input_mis_subj * 100, "%")) %>%
-  ggplot(aes(x = mis_lab, y = causal_method, fill = mean_bias)) +
-  geom_tile(color = "white", linewidth = 0.5) +
-  geom_text(aes(label = round(mean_bias, 3)), size = 3) +
+  ggplot(aes(x=mis_lab, y=causal_method, fill=mean_bias)) +
+  geom_tile(color="white", linewidth=0.5) +
+  geom_text(aes(label=round(mean_bias, 3)), size=3) +
   facet_grid(missing_method ~ missing_mechanism) +
-  scale_fill_gradient2(low = "#3498DB", mid = "white", high = "#E74C3C",
-                       midpoint = 0, name = "Bias\n(log HR)") +
-  labs(title = "Bias heatmap — OS",
+  scale_fill_gradient2(low="#3498DB", mid="white", high="#E74C3C",
+                       midpoint=0, name="Bias\n(log HR)") +
+  labs(title = "Bias heatmap - DFS",
        x = "Missingness proportion",
        y = "Causal method") +
   theme_sim()
+```
 
-# ── OS: Confounding ───────────────────────────────────────────────────────────
-p_confounding_os <- plot_base_confounding %>%
-  dplyr::filter(outcome == "OS") %>%
-  ggplot(aes(x = input_mis_subj, y = mean_bias,
-             color = factor(confounding_scale),
-             group = factor(confounding_scale))) +
-  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.5) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
+```{r p-coverage-box}
+p_coverage_box <- plot_base %>%
+  dplyr::filter(outcome == "DFS") %>%
+  ggplot(aes(x=causal_method, y=mean_coverage, fill=causal_method)) +
+  geom_boxplot(alpha=0.7, outlier.shape=21, outlier.size=1.5) +
+  geom_hline(yintercept=0.95, linetype="dashed",
+             linewidth=0.5, color="red") +
   facet_grid(missing_method ~ missing_mechanism) +
-  scale_color_manual(
-    values = c("0.5" = "#3498DB", "1" = "#E74C3C", "2" = "#2ECC71"),
-    name = "Confounding scale"
-  ) +
-  scale_x_continuous(breaks = c(0, 0.25, 0.50),
-                     labels = c("0%", "25%", "50%")) +
-  labs(title = "Bias across missingness mechanisms by confounding scale — OS",
+  scale_fill_manual(values=method_colors) +
+  labs(title = "Distribution of coverage probabilities - DFS",
+       x = "Causal method",
+       y = "Coverage probability") +
+  theme_sim() +
+  theme(legend.position = "none")
+
+p_coverage_box_os <- plot_base %>%
+  dplyr::filter(outcome == "OS") %>%
+  ggplot(aes(x=causal_method, y=mean_coverage, fill=causal_method)) +
+  geom_boxplot(alpha=0.7, outlier.shape=21, outlier.size=1.5) +
+  geom_hline(yintercept=0.95, linetype="dashed",
+             linewidth=0.5, color="red") +
+  facet_grid(missing_method ~ missing_mechanism) +
+  scale_fill_manual(values=method_colors) +
+  labs(title = "Distribution of coverage probabilities - OS",
+       x = "Causal method",
+       y = "Coverage probability") +
+  theme_sim() +
+  theme(legend.position = "none")
+```
+
+```{r p-combined-dfs}
+p_coverage_os <- plot_base %>%
+  dplyr::filter(outcome == "OS") %>%
+  ggplot(aes(x=input_mis_subj, y=mean_coverage,
+             color=causal_method, group=causal_method)) +
+  geom_hline(yintercept=0.95, linetype="dashed", linewidth=0.5) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  scale_color_manual(values=method_colors, name="Causal method") +
+  scale_x_continuous(breaks=c(0, 0.25, 0.50),
+                     labels=c("0%", "25%", "50%")) +
+  labs(title = "Coverage across missingness mechanisms - OS",
+       subtitle = "Dashed line = nominal 0.95 target",
+       x = "Missingness proportion",
+       y = "Average coverage") +
+  theme_sim()
+
+p_bias_os_combined <- plot_base %>%
+  dplyr::filter(outcome == "OS") %>%
+  ggplot(aes(x=input_mis_subj, y=mean_bias,
+             color=causal_method, group=causal_method)) +
+  geom_hline(yintercept=0, linetype="dashed", linewidth=0.5) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  scale_color_manual(values=method_colors, name="Causal method") +
+  scale_x_continuous(breaks=c(0, 0.25, 0.50),
+                     labels=c("0%", "25%", "50%")) +
+  labs(title = "Bias across missingness mechanisms - OS",
+       subtitle = "Dashed line = zero bias",
        x = "Missingness proportion",
        y = "Mean bias (log HR)") +
   theme_sim()
 
-# ── OS: Sample size ───────────────────────────────────────────────────────────
-p_sample_size_os <- plot_base_ss %>%
-  dplyr::filter(outcome == "OS") %>%
-  ggplot(aes(x = input_mis_subj, y = mean_coverage,
-             color = factor(input_ss),
-             group = factor(input_ss))) +
-  geom_hline(yintercept = 0.95, linetype = "dashed", linewidth = 0.5) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
+p_combined_dfs <- (p_coverage + p_bias) +
+  plot_layout(guides="collect") &
+  theme(legend.position = "bottom")
+
+p_combined_os <- (p_coverage_os + p_bias_os_combined) +
+  plot_layout(guides="collect") &
+  theme(legend.position = "bottom")
+```
+
+```{r p-confounding}
+p_confounding <- plot_base_confounding %>%
+  dplyr::filter(outcome == "DFS") %>%
+  ggplot(aes(x=input_mis_subj, y=mean_bias,
+             color=factor(confounding_scale),
+             group=factor(confounding_scale))) +
+  geom_hline(yintercept=0, linetype="dashed", linewidth=0.5) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2) +
   facet_grid(missing_method ~ missing_mechanism) +
   scale_color_manual(
-    values = c("500" = "#E74C3C", "1000" = "#3498DB"),
+    values = c("0.5"="#3498DB", "1"="#E74C3C", "2"="#2ECC71"),
+    name = "Confounding scale"
+  ) +
+  scale_x_continuous(breaks=c(0, 0.25, 0.50),
+                     labels=c("0%", "25%", "50%")) +
+  labs(title = "Bias across missingness mechanisms by confounding scale - DFS",
+       x = "Missingness proportion",
+       y = "Mean bias (log HR)") +
+  theme_sim()
+```
+
+```{r p-sample-size}
+p_sample_size <- plot_base_ss %>%
+  dplyr::filter(outcome == "DFS") %>%
+  ggplot(aes(x=input_mis_subj, y=mean_coverage,
+             color=factor(input_ss),
+             group=factor(input_ss))) +
+  geom_hline(yintercept=0.95, linetype="dashed", linewidth=0.5) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  scale_color_manual(
+    values = c("500"="#E74C3C", "1000"="#3498DB"),
     name = "Sample size"
   ) +
-  scale_x_continuous(breaks = c(0, 0.25, 0.50),
-                     labels = c("0%", "25%", "50%")) +
-  labs(title = "Coverage across missingness mechanisms by sample size — OS",
+  scale_x_continuous(breaks=c(0, 0.25, 0.50),
+                     labels=c("0%", "25%", "50%")) +
+  labs(title = "Coverage across missingness mechanisms by sample size - DFS",
        x = "Missingness proportion",
        y = "Average coverage") +
   theme_sim()
+```
+
+```{r print-dfs-plots}
+print(p_coverage)
+print(p_bias)
+print(p_rmse)
+print(p_heat_coverage)
+print(p_heat_bias)
+print(p_coverage_box)
+print(p_combined_dfs)
+print(p_confounding)
+print(p_sample_size)
+```
+
+# OS Plots
+
+```{r p-bias-os}
+p_bias_os <- plot_base %>%
+  dplyr::filter(outcome == "OS") %>%
+  ggplot(aes(x=input_mis_subj, y=mean_bias,
+             color=causal_method, group=causal_method)) +
+  geom_hline(yintercept=0, linetype="dashed",
+             color="black", linewidth=0.5) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  scale_color_manual(values=method_colors, name="Causal method") +
+  scale_x_continuous(breaks=c(0, 0.25, 0.50),
+                     labels=c("0%", "25%", "50%")) +
+  labs(title = "Bias across missingness mechanisms - OS",
+       subtitle = "Dashed line = zero bias",
+       x = "Missingness proportion",
+       y = "Mean bias (log HR)") +
+  theme_sim()
+```
+
+```{r p-rmse-os}
+p_rmse_os <- plot_base %>%
+  dplyr::filter(outcome == "OS") %>%
+  ggplot(aes(x=input_mis_subj, y=mean_rmse,
+             color=causal_method, group=causal_method)) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  scale_color_manual(values=method_colors, name="Causal method") +
+  scale_x_continuous(breaks=c(0, 0.25, 0.50),
+                     labels=c("0%", "25%", "50%")) +
+  labs(title = "RMSE across missingness mechanisms - OS",
+       x = "Missingness proportion",
+       y = "RMSE") +
+  theme_sim()
+```
+
+```{r p-heat-coverage-os}
+p_heat_coverage_os <- plot_base %>%
+  dplyr::filter(outcome == "OS") %>%
+  dplyr::mutate(
+    mis_lab = paste0(input_mis_subj * 100, "%"),
+    coverage_cat = case_when(
+      mean_coverage < 0.90 ~ "< 0.90",
+      mean_coverage < 0.93 ~ "0.90-0.93",
+      mean_coverage < 0.95 ~ "0.93-0.95",
+      mean_coverage <= 0.97 ~ "0.95-0.97",
+       ~ "> 0.97"
+    ),
+    coverage_cat = factor(coverage_cat,
+                          levels = c("< 0.90", "0.90-0.93", "0.93-0.95",
+                                     "0.95-0.97", "> 0.97"))
+  ) %>%
+  ggplot(aes(x=mis_lab, y=causal_method, fill=coverage_cat)) +
+  geom_tile(color="white", linewidth=0.5) +
+  geom_text(aes(label=round(mean_coverage, 3)), size=3) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  scale_fill_manual(
+    values = c("< 0.90" = "#d73027",
+               "0.90-0.93" = "#fc8d59",
+               "0.93-0.95" = "#fee090",
+               "0.95-0.97" = "#91cf60",
+               "> 0.97" = "#1a9850"),
+    name = "Coverage"
+  ) +
+  labs(title = "Coverage heatmap - OS",
+       x = "Missingness proportion",
+       y = "Causal method") +
+  theme_sim()
+```
+
+```{r p-heat-bias-os}
+p_heat_bias_os <- plot_base %>%
+  dplyr::filter(outcome == "OS") %>%
+  dplyr::mutate(mis_lab = paste0(input_mis_subj * 100, "%")) %>%
+  ggplot(aes(x=mis_lab, y=causal_method, fill=mean_bias)) +
+  geom_tile(color="white", linewidth=0.5) +
+  geom_text(aes(label=round(mean_bias, 3)), size=3) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  scale_fill_gradient2(low="#3498DB", mid="white", high="#E74C3C",
+                       midpoint=0, name="Bias\n(log HR)") +
+  labs(title = "Bias heatmap - OS",
+       x = "Missingness proportion",
+       y = "Causal method") +
+  theme_sim()
+```
+
+```{r p-confounding-os}
+p_confounding_os <- plot_base_confounding %>%
+  dplyr::filter(outcome == "OS") %>%
+  ggplot(aes(x=input_mis_subj, y=mean_bias,
+             color=factor(confounding_scale),
+             group=factor(confounding_scale))) +
+  geom_hline(yintercept=0, linetype="dashed", linewidth=0.5) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  scale_color_manual(
+    values = c("0.5"="#3498DB", "1"="#E74C3C", "2"="#2ECC71"),
+    name = "Confounding scale"
+  ) +
+  scale_x_continuous(breaks=c(0, 0.25, 0.50),
+                     labels=c("0%", "25%", "50%")) +
+  labs(title = "Bias across missingness mechanisms by confounding scale - OS",
+       x = "Missingness proportion",
+       y = "Mean bias (log HR)") +
+  theme_sim()
+```
+
+```{r p-sample-size-os}
+p_sample_size_os <- plot_base_ss %>%
+  dplyr::filter(outcome == "OS") %>%
+  ggplot(aes(x=input_mis_subj, y=mean_coverage,
+             color=factor(input_ss),
+             group=factor(input_ss))) +
+  geom_hline(yintercept=0.95, linetype="dashed", linewidth=0.5) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2) +
+  facet_grid(missing_method ~ missing_mechanism) +
+  scale_color_manual(
+    values = c("500"="#E74C3C", "1000"="#3498DB"),
+    name = "Sample size"
+  ) +
+  scale_x_continuous(breaks=c(0, 0.25, 0.50),
+                     labels=c("0%", "25%", "50%")) +
+  labs(title = "Coverage across missingness mechanisms by sample size - OS",
+       x = "Missingness proportion",
+       y = "Average coverage") +
+  theme_sim()
+```
+
+```{r print-os-plots}
+print(p_coverage_os)
 print(p_bias_os)
 print(p_rmse_os)
 print(p_heat_coverage_os)
+print(p_heat_bias_os)
+print(p_coverage_box_os)
+print(p_combined_os)
 print(p_confounding_os)
 print(p_sample_size_os)
-
-# ── Save OS plots ─────────────────────────────────────────────────────────────
-ggsave("practicum_paper/outputs/p_bias_os.png",
-       p_bias_os, width=10, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_rmse_os.png",
-       p_rmse_os, width=10, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_heat_coverage_os.png",
-       p_heat_coverage_os, width=10, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_heat_bias_os.png",
-       p_heat_bias_os, width=10, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_confounding_os.png",
-       p_confounding_os, width=14, height=6, dpi=300)
-ggsave("practicum_paper/outputs/p_sample_size_os.png",
-       p_sample_size_os, width=14, height=6, dpi=300)
 ```
 
+# Save All Plots
 
- 
- 
+```{r save-plots}
+# DFS
+ggsave("practicum_paper/outputs/p_coverage_dfs.png", p_coverage, width=10, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_bias_dfs.png", p_bias, width=10, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_rmse_dfs.png", p_rmse, width=10, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_heat_coverage.png", p_heat_coverage, width=10, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_heat_bias.png", p_heat_bias, width=10, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_coverage_box.png", p_coverage_box, width=10, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_combined_dfs.png", p_combined_dfs, width=14, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_confounding.png", p_confounding, width=14, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_sample_size.png", p_sample_size, width=14, height=6, dpi=300)
+
+# OS
+ggsave("practicum_paper/outputs/p_coverage_os.png", p_coverage_os, width=10, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_bias_os.png", p_bias_os, width=10, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_rmse_os.png", p_rmse_os, width=10, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_heat_coverage_os.png", p_heat_coverage_os, width=10, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_heat_bias_os.png", p_heat_bias_os, width=10, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_coverage_box_os.png", p_coverage_box_os, width=10, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_combined_os.png", p_combined_os, width=14, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_confounding_os.png", p_confounding_os, width=14, height=6, dpi=300)
+ggsave("practicum_paper/outputs/p_sample_size_os.png", p_sample_size_os, width=14, height=6, dpi=300)
+
+cat("All plots saved\n")
+```
